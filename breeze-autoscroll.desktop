@@ -1,0 +1,13 @@
+#!/usr/bin/env xdg-open
+[Desktop Entry]
+Name=Breeze Autoscroll
+GenericName=Mausrad-Klick Autoscroll
+Comment=Windows-Mittelklick Autoscroll im Kubuntu 26.04 Breeze-Stil
+Exec=breeze-autoscroll
+Icon=preferences-desktop-mouse
+Terminal=false
+Type=Application
+Categories=Utility;Settings;Qt;KDE;
+StartupNotify=false
+X-KDE-autostart-phase=2
+X-GNOME-Autostart-enabled=true

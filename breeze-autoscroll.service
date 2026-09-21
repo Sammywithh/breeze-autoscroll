@@ -1,0 +1,13 @@
+[Unit]
+Description=Breeze Autoscroll (Windows-style Middle Click Scroll for KDE Plasma 6)
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/breeze-autoscroll
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=graphical-session.target
