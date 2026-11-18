@@ -61,7 +61,10 @@ systemctl --user daemon-reload 2>/dev/null || true
 # 5. Configure uinput Permissions (udev)
 echo "[5/5] Konfiguriere Eingabeberechtigungen (uinput / input-Gruppe)..."
 if [ -f "${SCRIPT_DIR}/udev/99-uinput-autoscroll.rules" ]; then
-    if command -v sudo &>/dev/null && [ "$EUID" -ne 0 ]; then
+    if cmp -s "${SCRIPT_DIR}/udev/99-uinput-autoscroll.rules" /etc/udev/rules.d/99-uinput-autoscroll.rules 2>/dev/null \
+        && id -nG "${USER}" 2>/dev/null | grep -qw "input"; then
+        echo "✓ udev-Regel und 'input'-Gruppenrechte sind bereits eingerichtet."
+    elif command -v sudo &>/dev/null && [ "$EUID" -ne 0 ] && { [ -t 0 ] || sudo -n true 2>/dev/null; }; then
         echo "Richte udev-Regel für /dev/uinput ein..."
         sudo cp "${SCRIPT_DIR}/udev/99-uinput-autoscroll.rules" /etc/udev/rules.d/ 2>/dev/null || true
         sudo udevadm control --reload-rules 2>/dev/null || true
