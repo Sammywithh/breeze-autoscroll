@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Installation Script: Breeze Autoscroll for Kubuntu 26.04 (KDE Plasma 6)
+# Installation Script: Breeze Autoscroll (Rust) for Kubuntu 26.04 (KDE Plasma 6)
 # ==============================================================================
 
 set -e
@@ -11,70 +11,54 @@ DESKTOP_DIR="${HOME}/.local/share/applications"
 AUTOSTART_DIR="${HOME}/.config/autostart"
 SYSTEMD_USER_DIR="${HOME}/.config/systemd/user"
 SHARE_DIR="${HOME}/.local/share/breeze-autoscroll"
+TARGET_BIN="${BIN_DIR}/breeze-autoscroll"
 
 echo "============================================================"
-echo "  Breeze Autoscroll - Installation für Kubuntu 26.04"
+echo "  Breeze Autoscroll v2.0 (Rust) - Installation für Kubuntu 26.04"
 echo "============================================================"
 echo ""
 
 # 1. Ensure required directories exist
-mkdir -p "${BIN_DIR}" "${DESKTOP_DIR}" "${AUTOSTART_DIR}" "${SYSTEMD_USER_DIR}" "${SHARE_DIR}"
+mkdir -p "${BIN_DIR}" "${DESKTOP_DIR}" "${AUTOSTART_DIR}" "${SYSTEMD_USER_DIR}"
 
-# 2. Check & Install Python Dependencies
-echo "[1/5] Prüfe Python-Abhängigkeiten..."
-MISSING_PKGS=""
-if ! python3 -c "import PyQt6" 2>/dev/null; then
-    MISSING_PKGS="${MISSING_PKGS} python3-pyqt6"
-fi
-if ! python3 -c "import evdev" 2>/dev/null; then
-    MISSING_PKGS="${MISSING_PKGS} python3-evdev"
-fi
-
-if [ -n "${MISSING_PKGS}" ]; then
-    echo "Folgende Pakete werden benötigt:${MISSING_PKGS}"
-    if command -v sudo &>/dev/null && [ "$EUID" -ne 0 ]; then
-        echo "Installiere Pakete mit apt..."
-        sudo apt-get update -qq && sudo apt-get install -y ${MISSING_PKGS}
-    else
-        echo "HINWEIS: Bitte führe folgenden Befehl aus, um die Pakete zu installieren:"
-        echo "  sudo apt-get install -y ${MISSING_PKGS}"
-    fi
+# 2. Build or locate native Rust binary
+echo "[1/5] Bereite natives Rust-Binary vor..."
+SOURCE_BIN=""
+if command -v cargo &>/dev/null && [ -f "${SCRIPT_DIR}/Cargo.toml" ]; then
+    echo "Kompiliere Release-Binary mit Cargo..."
+    (cd "${SCRIPT_DIR}" && cargo build --release --locked)
+    SOURCE_BIN="${SCRIPT_DIR}/target/release/breeze-autoscroll"
+    cp "${SOURCE_BIN}" "${SCRIPT_DIR}/breeze-autoscroll"
+    chmod +x "${SCRIPT_DIR}/breeze-autoscroll"
+elif [ -x "${SCRIPT_DIR}/breeze-autoscroll" ]; then
+    SOURCE_BIN="${SCRIPT_DIR}/breeze-autoscroll"
+    echo "✓ Verwende vorkompiliertes Binary: ${SOURCE_BIN}"
 else
-    echo "✓ Alle Python-Abhängigkeiten (PyQt6, evdev) sind vorhanden."
-fi
-
-# 3. Install Executable Launcher
-echo "[2/5] Installiere Starter in ${BIN_DIR}/breeze-autoscroll..."
-cat << 'EOF' > "${BIN_DIR}/breeze-autoscroll"
-#!/usr/bin/env bash
-PROJECT_DIR="${HOME}/KI-Agentic-Projects/breeze-autoscroll/src"
-SHARE_DIR="${HOME}/.local/share/breeze-autoscroll"
-
-if [ -d "${PROJECT_DIR}" ]; then
-    exec /usr/bin/python3 "${PROJECT_DIR}/main.py" "$@"
-elif [ -d "${SHARE_DIR}" ]; then
-    exec /usr/bin/python3 "${SHARE_DIR}/main.py" "$@"
-else
-    echo "Fehler: Breeze Autoscroll Source-Dateien nicht gefunden." >&2
+    echo "Fehler: Weder 'cargo' noch vorkompiliertes './breeze-autoscroll' gefunden." >&2
     exit 1
 fi
-EOF
-chmod +x "${BIN_DIR}/breeze-autoscroll"
 
-# Copy source to share directory as permanent install
-cp -r "${SCRIPT_DIR}/src"/* "${SHARE_DIR}/"
+# 3. Stop any running instance (legacy Python or older Rust binary)
+echo "[2/5] Stoppe eventuell laufende alte Prozesse..."
+pkill -f "breeze-autoscroll/src/main.py" 2>/dev/null || true
+pkill -x "breeze-autoscroll" 2>/dev/null || true
+rm -rf "${SHARE_DIR}"
+
+# Install native binary
+echo "[3/5] Installiere Binary nach ${TARGET_BIN}..."
+install -m 755 "${SOURCE_BIN}" "${TARGET_BIN}"
 
 # 4. Install Desktop Starter & Autostart
-echo "[3/5] Erstelle Anwendungs- und Autostart-Einträge..."
-cp "${SCRIPT_DIR}/breeze-autoscroll.desktop" "${DESKTOP_DIR}/breeze-autoscroll.desktop"
-cp "${SCRIPT_DIR}/breeze-autoscroll.desktop" "${AUTOSTART_DIR}/breeze-autoscroll.desktop"
+echo "[4/5] Erstelle Anwendungs- und Autostart-Einträge..."
+sed "s|^Exec=.*|Exec=${TARGET_BIN}|" "${SCRIPT_DIR}/breeze-autoscroll.desktop" > "${DESKTOP_DIR}/breeze-autoscroll.desktop"
+cp "${DESKTOP_DIR}/breeze-autoscroll.desktop" "${AUTOSTART_DIR}/breeze-autoscroll.desktop"
 chmod +x "${DESKTOP_DIR}/breeze-autoscroll.desktop"
 
-# 5. Install Systemd User Service
-echo "[4/5] Richte Systemd-Dienst ein..."
+# Install Systemd User Service
 cp "${SCRIPT_DIR}/breeze-autoscroll.service" "${SYSTEMD_USER_DIR}/breeze-autoscroll.service"
+systemctl --user daemon-reload 2>/dev/null || true
 
-# 6. Configure uinput Permissions (udev)
+# 5. Configure uinput Permissions (udev)
 echo "[5/5] Konfiguriere Eingabeberechtigungen (uinput / input-Gruppe)..."
 if [ -f "${SCRIPT_DIR}/udev/99-uinput-autoscroll.rules" ]; then
     if command -v sudo &>/dev/null && [ "$EUID" -ne 0 ]; then
@@ -93,16 +77,13 @@ if [ -f "${SCRIPT_DIR}/udev/99-uinput-autoscroll.rules" ]; then
     fi
 fi
 
-# 7. Restart any running process
-pkill -f "breeze-autoscroll/src/main.py" 2>/dev/null || true
-
 echo ""
 echo "============================================================"
 echo "  ✓ Installation / Aktualisierung erfolgreich abgeschlossen!"
 echo "============================================================"
 echo ""
 echo "Verwaltung:"
-echo " • Starten:              ~/.local/bin/breeze-autoscroll"
-echo " • Einstellungen:        ~/.local/bin/breeze-autoscroll --settings"
+echo " • Starten:              ${TARGET_BIN}"
+echo " • Einstellungen:        ${TARGET_BIN} --settings"
 echo " • Systemd-Dienst aktiv: systemctl --user enable --now breeze-autoscroll"
 echo ""

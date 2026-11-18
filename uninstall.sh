@@ -15,8 +15,8 @@ if systemctl --user is-active --quiet breeze-autoscroll 2>/dev/null; then
     systemctl --user disable breeze-autoscroll 2>/dev/null || true
 fi
 
-# 2. Kill running processes
-killall -q breeze-autoscroll 2>/dev/null || true
+# 2. Kill running processes (Rust & legacy Python)
+pkill -x "breeze-autoscroll" 2>/dev/null || true
 pkill -f "breeze-autoscroll/src/main.py" 2>/dev/null || true
 
 # 3. Remove installed files
@@ -26,6 +26,7 @@ rm -f "${HOME}/.local/share/applications/breeze-autoscroll.desktop"
 rm -f "${HOME}/.config/autostart/breeze-autoscroll.desktop"
 rm -f "${HOME}/.config/systemd/user/breeze-autoscroll.service"
 rm -rf "${HOME}/.local/share/breeze-autoscroll"
+rm -rf "${HOME}/.cache/breeze-autoscroll"
 
 # 4. Optional removal of udev rule
 if [ -f /etc/udev/rules.d/99-uinput-autoscroll.rules ]; then

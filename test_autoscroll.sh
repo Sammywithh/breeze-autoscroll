@@ -1,16 +1,22 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Test Script for Breeze Autoscroll
+# Test & Run Script for Breeze Autoscroll (Rust)
 # ==============================================================================
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-export PYTHONPATH="${SCRIPT_DIR}/src:${PYTHONPATH}"
+set -e
 
-echo "=== Breeze Autoscroll Testlauf ==="
-echo "1) Syntaxprüfung aller Python-Module..."
-python3 -m py_compile "${SCRIPT_DIR}/src"/*.py
-echo "✓ Alle Python-Module kompilieren fehlerfrei!"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "${SCRIPT_DIR}"
+
+echo "=== Breeze Autoscroll Testlauf (Rust) ==="
+echo "1) Führe Unit-Tests aus..."
+cargo test --verbose
+echo "✓ Alle Unit-Tests bestanden!"
 echo ""
 
-echo "2) Starte Breeze Autoscroll im Vordergrund (Drücke Strg+C zum Beenden)..."
-python3 "${SCRIPT_DIR}/src/main.py" "$@"
+echo "2) Erstelle Release-Binary..."
+cargo build --release
+echo ""
+
+echo "3) Starte Breeze Autoscroll im Vordergrund (Drücke Strg+C zum Beenden)..."
+exec "${SCRIPT_DIR}/target/release/breeze-autoscroll" "$@"
