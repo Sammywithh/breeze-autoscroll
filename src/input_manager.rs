@@ -8,7 +8,7 @@ use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::Sender;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -1115,11 +1115,6 @@ fn read_device_events(dev: &EvdevDevice, out: &mut Vec<RawEvdevAction>) -> bool 
     }
 }
 
-/// Helper to create a dummy receiver when running headless tests without GUI overlay.
-pub fn dummy_indicator_channel() -> (Sender<IndicatorCommand>, Receiver<IndicatorCommand>) {
-    mpsc::channel()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1252,7 +1247,7 @@ mod tests {
         let mut sm = ScrollStateMachine::new();
         let mut cfg = ConfigData::default();
         cfg.mode = "toggle".to_string();
-        let mut emitter = MockEmitter::default();
+        let emitter = MockEmitter::default();
         let t0 = Instant::now();
 
         sm.on_middle_down(t0, &cfg, (400, 400), || None);

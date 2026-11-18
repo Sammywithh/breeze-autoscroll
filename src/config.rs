@@ -5,7 +5,7 @@
 
 use std::env;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
 use serde::{Deserialize, Serialize};
@@ -323,7 +323,8 @@ impl ConfigManager {
     }
 
     /// Returns the path to `config.json`.
-    pub fn config_path(&self) -> &Path {
+    #[cfg(test)]
+    pub fn config_path(&self) -> &std::path::Path {
         &self.config_file
     }
 }
