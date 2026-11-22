@@ -126,21 +126,21 @@ fn run_daemon(open_settings: bool) -> ExitCode {
         }
     };
 
-    // Start KWin Wayland window & browser tab tracker
-    window_detector::install_and_start_kwin_tracker();
+    // Start KWin Wayland window & pointer bridge
+    window_tracker.start_kwin_bridge();
 
     // Start translucent X11/XWayland Breeze indicator overlay thread
     let (mut indicator_handle, indicator_tx) = IndicatorHandle::spawn();
 
     // Start evdev/uinput autoscroll engine
-    let mut input_engine = match InputEngine::start(config_mgr.clone(), window_tracker, indicator_tx)
-    {
-        Ok(engine) => Some(engine),
-        Err(err) => {
-            eprintln!("[InputManager] {err}");
-            None
-        }
-    };
+    let mut input_engine =
+        match InputEngine::start(config_mgr.clone(), window_tracker.clone(), indicator_tx) {
+            Ok(engine) => Some(engine),
+            Err(err) => {
+                eprintln!("[InputManager] {err}");
+                None
+            }
+        };
 
     if open_settings && let Ok(exe) = env::current_exe() {
         let _ = Command::new(exe).arg("--settings-window").spawn();
@@ -148,7 +148,7 @@ fn run_daemon(open_settings: bool) -> ExitCode {
 
     if input_engine.is_none() {
         indicator_handle.stop();
-        window_detector::stop_kwin_tracker();
+        window_tracker.stop_kwin_bridge();
         return ExitCode::FAILURE;
     }
 
@@ -163,7 +163,7 @@ fn run_daemon(open_settings: bool) -> ExitCode {
         engine.stop();
     }
     indicator_handle.stop();
-    window_detector::stop_kwin_tracker();
+    window_tracker.stop_kwin_bridge();
     ExitCode::SUCCESS
 }
 

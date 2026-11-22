@@ -251,6 +251,72 @@ impl AutoscrollControlIface {
             .window_tracker
             .update_from_kwin(app_class, app_name, desktop_file, title, cx, cy);
     }
+
+    #[allow(clippy::too_many_arguments)]
+    #[zbus(name = "ReportPointerProbe")]
+    fn report_pointer_probe(
+        &self,
+        cursor_x: String,
+        cursor_y: String,
+        virt_w: String,
+        virt_h: String,
+        app_class: String,
+        app_name: String,
+        desktop_file: String,
+        title: String,
+        is_dock_or_desktop: String,
+    ) {
+        let cx = cursor_x.trim().parse::<i32>().unwrap_or(0);
+        let cy = cursor_y.trim().parse::<i32>().unwrap_or(0);
+        let vw = virt_w.trim().parse::<i32>().unwrap_or(0);
+        let vh = virt_h.trim().parse::<i32>().unwrap_or(0);
+        let dock_or_desktop = is_dock_or_desktop.trim() == "1";
+        self.state.window_tracker.report_pointer_probe(
+            cx,
+            cy,
+            vw,
+            vh,
+            app_class,
+            app_name,
+            desktop_file,
+            title,
+            dock_or_desktop,
+        );
+    }
+
+    #[zbus(name = "UpdateCursorPos")]
+    fn update_cursor_pos(&self, cursor_x: String, cursor_y: String) {
+        if let (Ok(cx), Ok(cy)) = (
+            cursor_x.trim().parse::<i32>(),
+            cursor_y.trim().parse::<i32>(),
+        ) {
+            self.state.window_tracker.update_cursor_pos(cx, cy);
+        }
+    }
+
+    #[zbus(name = "DebugProbe")]
+    fn debug_probe(&self) -> String {
+        let probe = self
+            .state
+            .window_tracker
+            .probe_pointer_and_start_live_cursor();
+        self.state.window_tracker.stop_live_cursor();
+        let win_desc = probe
+            .window
+            .as_ref()
+            .map(|w| format!("class='{}' title='{}'", w.app_class, w.title))
+            .unwrap_or_else(|| "none".to_string());
+        format!(
+            "from_kwin={} cursor=({}, {}) overlay=({}, {}) dock_or_desktop={} {}",
+            probe.from_kwin,
+            probe.cursor_x,
+            probe.cursor_y,
+            probe.overlay_x,
+            probe.overlay_y,
+            probe.is_dock_or_desktop,
+            win_desc
+        )
+    }
 }
 
 // ============================================================================
