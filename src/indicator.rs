@@ -69,13 +69,31 @@ struct ArrowMask {
 }
 
 impl ArrowMask {
-    fn from_offset(delta_x: f32, delta_y: f32, deadzone: u32) -> Self {
+    fn from_offset(delta_x: f32, delta_y: f32, deadzone: u32, allow_horizontal: bool) -> Self {
         let dz = deadzone as f32;
-        Self {
-            up: delta_y < -dz,
-            down: delta_y > dz,
-            left: delta_x < -dz,
-            right: delta_x > dz,
+        if allow_horizontal {
+            if delta_x.hypot(delta_y) <= dz {
+                return Self {
+                    up: false,
+                    down: false,
+                    left: false,
+                    right: false,
+                };
+            }
+            let axis_thresh = dz * 0.4;
+            Self {
+                up: delta_y < -axis_thresh,
+                down: delta_y > axis_thresh,
+                left: delta_x < -axis_thresh,
+                right: delta_x > axis_thresh,
+            }
+        } else {
+            Self {
+                up: delta_y < -dz,
+                down: delta_y > dz,
+                left: false,
+                right: false,
+            }
         }
     }
 }
@@ -89,15 +107,17 @@ pub fn render_indicator_bgra(
     delta_x: f32,
     delta_y: f32,
     opacity: f32,
+    allow_horizontal: bool,
 ) -> Vec<u8> {
-    let arrows = ArrowMask::from_offset(delta_x, delta_y, deadzone);
-    render_indicator_with_mask(theme, deadzone, arrows, opacity)
+    let arrows = ArrowMask::from_offset(delta_x, delta_y, deadzone, allow_horizontal);
+    render_indicator_with_mask(theme, deadzone, arrows, allow_horizontal, opacity)
 }
 
 fn render_indicator_with_mask(
     theme: &str,
     deadzone: u32,
     arrows: ArrowMask,
+    allow_horizontal: bool,
     opacity: f32,
 ) -> Vec<u8> {
     let light = theme.eq_ignore_ascii_case("light");
@@ -213,25 +233,30 @@ fn render_indicator_with_mask(
                         sample = RgbaF::rgba(255, 255, 255, 240).blend_over(sample);
                     }
 
-                    // 5. Four directional arrows (North, South, West, East)
+                    // 5. Directional arrows: 2 arrows (North/South) or 4 arrows (2D mode)
                     let arrow_specs = [
-                        (0.0f32, -arrow_offset, 0.0f32, arrows.up),
-                        (0.0f32, arrow_offset, std::f32::consts::PI, arrows.down),
+                        (0.0f32, -arrow_offset, 0.0f32, arrows.up, true),
+                        (0.0f32, arrow_offset, std::f32::consts::PI, arrows.down, true),
                         (
                             -arrow_offset,
                             0.0f32,
                             -std::f32::consts::FRAC_PI_2,
                             arrows.left,
+                            allow_horizontal,
                         ),
                         (
                             arrow_offset,
                             0.0f32,
                             std::f32::consts::FRAC_PI_2,
                             arrows.right,
+                            allow_horizontal,
                         ),
                     ];
 
-                    for &(ax, ay, rot, is_active) in &arrow_specs {
+                    for &(ax, ay, rot, is_active, enabled_axis) in &arrow_specs {
+                        if !enabled_axis {
+                            continue;
+                        }
                         let lx = dx - ax;
                         let ly = dy - ay;
                         // Rotate point into arrow local coordinate space (tip pointing -Y)
@@ -338,6 +363,7 @@ struct X11OverlayWindow {
     theme: String,
     deadzone: u32,
     opacity: f32,
+    allow_horizontal: bool,
     last_mask: ArrowMask,
     pixels: Vec<u8>,
 }
@@ -430,7 +456,7 @@ impl X11OverlayWindow {
             left: false,
             right: false,
         };
-        let pixels = render_indicator_with_mask("dark", 12, initial_mask, 0.92);
+        let pixels = render_indicator_with_mask("dark", 12, initial_mask, true, 0.92);
 
         Some(Self {
             conn,
@@ -441,12 +467,21 @@ impl X11OverlayWindow {
             theme: "dark".to_string(),
             deadzone: 12,
             opacity: 0.92,
+            allow_horizontal: true,
             last_mask: initial_mask,
             pixels,
         })
     }
 
-    fn show(&mut self, anchor_x: i32, anchor_y: i32, deadzone: u32, theme: String, opacity: f32) {
+    fn show(
+        &mut self,
+        anchor_x: i32,
+        anchor_y: i32,
+        deadzone: u32,
+        theme: String,
+        opacity: f32,
+        allow_horizontal: bool,
+    ) {
         let half = (INDICATOR_SIZE as i32) / 2;
         let x = anchor_x - half;
         let y = anchor_y - half;
@@ -454,14 +489,20 @@ impl X11OverlayWindow {
         self.theme = theme;
         self.deadzone = deadzone;
         self.opacity = opacity;
+        self.allow_horizontal = allow_horizontal;
         self.last_mask = ArrowMask {
             up: false,
             down: false,
             left: false,
             right: false,
         };
-        self.pixels =
-            render_indicator_with_mask(&self.theme, self.deadzone, self.last_mask, self.opacity);
+        self.pixels = render_indicator_with_mask(
+            &self.theme,
+            self.deadzone,
+            self.last_mask,
+            self.allow_horizontal,
+            self.opacity,
+        );
 
         let _ = self.conn.configure_window(
             self.win,
@@ -481,13 +522,15 @@ impl X11OverlayWindow {
         if !self.is_mapped {
             return;
         }
-        let next_mask = ArrowMask::from_offset(delta_x, delta_y, self.deadzone);
+        let next_mask =
+            ArrowMask::from_offset(delta_x, delta_y, self.deadzone, self.allow_horizontal);
         if next_mask != self.last_mask {
             self.last_mask = next_mask;
             self.pixels = render_indicator_with_mask(
                 &self.theme,
                 self.deadzone,
                 self.last_mask,
+                self.allow_horizontal,
                 self.opacity,
             );
             self.upload_pixels();
@@ -616,13 +659,20 @@ fn run_indicator_loop(rx: Receiver<IndicatorCommand>) {
                 deadzone,
                 theme,
                 opacity,
-                allow_horizontal: _,
+                allow_horizontal,
             } => {
                 if overlay.is_none() {
                     overlay = X11OverlayWindow::new();
                 }
                 if let Some(ov) = overlay.as_mut() {
-                    ov.show(anchor_x, anchor_y, deadzone, theme, opacity);
+                    ov.show(
+                        anchor_x,
+                        anchor_y,
+                        deadzone,
+                        theme,
+                        opacity,
+                        allow_horizontal,
+                    );
                 }
             }
             IndicatorCommand::UpdateOffset { delta_x, delta_y } => {
@@ -647,7 +697,7 @@ mod tests {
 
     #[test]
     fn renders_44x44_indicator_with_transparent_corners_and_opaque_center() {
-        let dark = render_indicator_bgra("dark", 12, 0.0, 0.0, 0.92);
+        let dark = render_indicator_bgra("dark", 12, 0.0, 0.0, 0.92, true);
         assert_eq!(dark.len(), INDICATOR_SIZE * INDICATOR_SIZE * 4);
 
         // Corner (0, 0) must be completely transparent
@@ -658,14 +708,33 @@ mod tests {
         assert!(dark[center_idx + 3] > 200);
 
         // Light theme renders distinct colors from dark theme
-        let light = render_indicator_bgra("light", 12, 0.0, 0.0, 0.92);
+        let light = render_indicator_bgra("light", 12, 0.0, 0.0, 0.92, true);
         assert_ne!(dark, light);
     }
 
     #[test]
-    fn highlights_active_direction_arrow_differently_from_idle() {
-        let idle = render_indicator_bgra("dark", 12, 0.0, 0.0, 0.92);
-        let scrolling_up = render_indicator_bgra("dark", 12, 0.0, -30.0, 0.92);
+    fn renders_two_arrows_when_horizontal_disabled_and_four_when_enabled() {
+        let two_way = render_indicator_bgra("dark", 12, 0.0, 0.0, 0.92, false);
+        let four_way = render_indicator_bgra("dark", 12, 0.0, 0.0, 0.92, true);
+        assert_ne!(two_way, four_way);
+
+        // Sideways offset in 2-way mode must not light up left/right arrows
+        let two_way_sideways = render_indicator_bgra("dark", 12, 40.0, 0.0, 0.92, false);
+        assert_eq!(two_way, two_way_sideways);
+    }
+
+    #[test]
+    fn highlights_active_and_diagonal_direction_arrows() {
+        let idle = render_indicator_bgra("dark", 12, 0.0, 0.0, 0.92, true);
+        let scrolling_up = render_indicator_bgra("dark", 12, 0.0, -30.0, 0.92, true);
+        let diagonal = render_indicator_bgra("dark", 12, 30.0, -30.0, 0.92, true);
         assert_ne!(idle, scrolling_up);
+        assert_ne!(scrolling_up, diagonal);
+
+        let mask = ArrowMask::from_offset(30.0, -30.0, 12, true);
+        assert!(mask.up);
+        assert!(mask.right);
+        assert!(!mask.down);
+        assert!(!mask.left);
     }
 }

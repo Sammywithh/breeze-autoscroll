@@ -8,7 +8,7 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "${SCRIPT_DIR}"
 
-VERSION="2.0.0"
+VERSION="2.1.0"
 PKG_NAME="breeze-autoscroll"
 ARCH="$(dpkg --print-architecture 2>/dev/null || echo amd64)"
 BUILD_DIR="${PKG_NAME}_${VERSION}_${ARCH}"

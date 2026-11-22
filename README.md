@@ -6,17 +6,22 @@
 
 ## 🌟 Übersicht
 
-Unter Windows ermöglicht ein Klick mit dem Mausrad (Mittelklick) das automatische Scrollen durch Bewegen der Maus. **Breeze Autoscroll v2.0** wurde vollständig von Python/PyQt6 nach **Rust** migriert und bringt diese Funktion blitzschnell, ressourcensparend und systemweit nach **Kubuntu 26.04 LTS (KDE Plasma 6)**:
+Unter Windows aktiviert ein Mittelklick (Drücken des Mausrades) auf einer freien Fläche einer scrollbaren Seite den Autoscroll-Modus (Automatisches Bildlaufen / Panning). **Breeze Autoscroll v2.1** setzt dieses Funktionsprinzip exakt und nativ in **Rust** für **Kubuntu 26.04 LTS (KDE Plasma 6)** um:
 
-- 🛡️ **Zweistufiger 3D / CAD & Slicer Schutz** *(Neu in v2.0)*:
-  - **Stufe 1 — 3D-Orbit/Pan-Gestenerkennung**: Wenn du das Mausrad drückst und die Maus sofort zum Drehen oder Schwenken bewegst, bricht Autoscroll augenblicklich ab und lässt die native 3D-Kamera-Navigation unberührt.
-  - **Stufe 2 — Automatische Fenster- & Browser-Tab-Erkennung**: Erkennt aktive Fensterklassen und Browser-Tab-Titel unter KDE Plasma 6 Wayland (KWin D-Bus) sowie X11 und deaktiviert Autoscroll automatisch u. a. in **Onshape**, **Bambu Studio**, **OrcaSlicer**, **PrusaSlicer**, **Cura**, **FreeCAD**, **Blender**, **KiCad**, **Tinkercad** und **Sketchfab** (in den Einstellungen frei anpassbar).
-- 🎯 **Klick & Scroll mit Hi-Res Smooth Scrolling**: Sendet echte hochauflösende `REL_WHEEL_HI_RES` / `REL_HWHEEL_HI_RES` Events via Linux Kernel `uinput` für butterweiches, pixelgenaues 2D-Scrollen.
-- 🎨 **KDE Plasma 6 Breeze Design**:
-  - Klick-durchlässiges, 4× supersampled 32-Bit-ARGB-Overlay im Breeze-Dunkel- oder Breeze-Hell-Stil.
-  - Natives KDE System-Tray-Applet (`StatusNotifierItem` + `dbusmenu`) und Breeze-Einstellungsdialog (`eframe`/`egui`).
-- ⌨️ **Sofort-Abbruch**: Stoppt bei jedem Mausklick, beim Drehen des physischen Mausrads oder per `ESC`-Taste.
-- 🔌 **Hotplug-Unterstützung**: Erkennt neu angeschlossene USB- und Bluetooth-Mäuse automatisch.
+- 🎯 **Ankerpunkt und Vektorsteuerung (2-Wege & 4-Wege)**:
+  - Beim Drücken des Mausrades erscheint an der exakten Klickposition (auch unter KDE Plasma 6 Wayland Multi-Monitor) ein feststehendes Ankersymbol mit Mittelpunkt und **2 Pfeilen** (Hoch/Runter) bzw. **4 Pfeilen** (wenn horizontales 2D-Scrollen aktiviert ist).
+  - **Totzone (Stillstand)**: Solange der Mauszeiger direkt auf dem Ankersymbol innerhalb der Totzone bleibt, steht die Ansicht still.
+  - **Richtung & Diagonal**: Bewegt man die Maus vom Anker weg, scrollt die Ansicht exakt in diese Richtung – bei aktiviertem 4-Wege-Anker stufenlos in alle Richtungen inkl. diagonal.
+  - **Progressive Geschwindigkeit**: Kleine Abstände ermöglichen langsames, ruhiges Mitlesen; größere Abstände beschleunigen nicht-linear für schnelles Durchscrollen.
+- 🔄 **Automatische Erkennung der zwei Windows-Bedienmodi**:
+  - **Einrast-Modus (Klick und loslassen)**: Ein kurzes Drücken und sofortiges Loslassen des Mausrades in der Totzone fixiert den Anker dauerhaft. Beendet wird per beliebigem Mausklick (links, rechts oder mitte), physischem Mausrad oder `ESC`.
+  - **Halte-Modus (Drücken, ziehen, loslassen)**: Hält man das Mausrad gedrückt und zieht den Zeiger direkt aus der Totzone heraus, scrollt die Seite genau so lange, wie die Taste gehalten wird. Beim Loslassen verschwindet der Anker sofort.
+- 🛡️ **3D / CAD & Slicer Schutz (Onshape, Bambu Studio, etc.)**:
+  - Erkennt automatisch das Fenster direkt unter dem Klick sowie aktive Browser-Tabs via KDE KWin & X11 und lässt natives 3D-Orbit/Pan in **Onshape**, **Bambu Studio**, **OrcaSlicer**, **PrusaSlicer**, **Cura**, **FreeCAD**, **Blender**, **KiCad**, **Tinkercad** und **Sketchfab** vollständig unberührt.
+  - Optional lässt sich in den Einstellungen zusätzlich ein strenger Orbit-Schutz für nicht gelistete 3D-Websites aktivieren.
+- 🎨 **KDE Plasma 6 Breeze Design & Hi-Res Smooth Scrolling**:
+  - Klick-durchlässiges, 4× supersampled 32-Bit-ARGB-Overlay im Breeze-Dunkel- oder Breeze-Hell-Stil und natives System-Tray-Applet (`StatusNotifierItem`).
+  - Feingranulare `REL_WHEEL_HI_RES` / `REL_HWHEEL_HI_RES` Events via Linux Kernel `uinput` mit automatischer Maus-Hotplug-Erkennung.
 
 ---
 
@@ -38,7 +43,7 @@ Alternativ kannst du ein Debian-Paket (`.deb`) erstellen oder direkt installiere
 
 ```bash
 ./build_deb.sh
-sudo apt install ./breeze-autoscroll_2.0.0_amd64.deb
+sudo apt install ./breeze-autoscroll_2.1.0_amd64.deb
 ```
 
 ---
@@ -46,11 +51,9 @@ sudo apt install ./breeze-autoscroll_2.0.0_amd64.deb
 ## 📖 Bedienung
 
 ### 1. Autoscroll auslösen
-- **Mausrad kurz stationär drücken & halten (~180 ms)**: Zeigt den Breeze-Indikator am Klickpunkt an.
-- **Kurzer Klick (< 180 ms)**: Bleibt im Hybrid-Modus ein normaler Mittelklick (Tab schließen, Link öffnen, Text einfügen).
-- **Sofortiges Ziehen mit gedrücktem Mausrad**: Wird als 3D-Orbit/Pan-Drag erkannt — Autoscroll löst nicht aus.
-- **Autoscroll beenden**:
-  - Beliebigen Mausklick (Links-, Rechts- oder Mittelklick), physisches Mausrad drehen oder `ESC` drücken.
+- **Einrast-Modus**: Mausrad kurz drücken und innerhalb der Totzone sofort loslassen $\rightarrow$ Anker bleibt fixiert; Beenden durch Links-, Rechts- oder Mittelklick, physisches Mausrad oder `ESC`.
+- **Halte-Modus**: Mausrad drücken, Zeiger direkt aus der Totzone ziehen und zum Beenden einfach wieder loslassen.
+- **3D-Programme & CAD**: In erkannten 3D-Anwendungen und 3D-Browser-Tabs (z. B. Onshape, Bambu Studio) bleibt das Mittelklick-Drehen automatisch nativ erhalten.
 
 ---
 
@@ -63,12 +66,13 @@ breeze-autoscroll --settings
 ```
 
 ### Optionen im Überblick:
-- **Mausrad-Klick Verhalten**: *Intelligenter Hybrid-Modus (Standard)*, *Klick zum Umschalten (Toggle)* oder *Gedrückt halten & Ziehen (Drag)*.
+- **Mausrad-Klick Verhalten**: *Windows-Automatik (Einrast- & Halte-Modus, Standard)*, *Immer Einrast-Modus (Toggle)* oder *Immer Halte-Modus (Drag)*.
+- **Anker-Typ**: *4-Wege-Anker inkl. Diagonal* (wenn horizontales 2D-Scrollen aktiviert) oder *2-Wege-Anker* (nur Vertikal).
 - **3D-Raum, CAD & Slicer Schutz**:
-  - 3D-Orbit/Pan-Erkennung beim direkten Ziehen ein-/ausschalten.
   - Automatische Deaktivierung in 3D-Apps & 3D-Websites + frei bearbeitbare Liste ausgeschlossener Apps und Fenstertitel-Keywords.
+  - Optionaler strenger Orbit-Schutz bei sofortiger Bewegung für nicht gelistete 3D-Websites.
 - **Geschwindigkeit & Totbereich**: Scroll-Geschwindigkeit (`20%`–`300%`) und Totzone (`4 px`–`30 px`).
-- **2D-Scrollen & Erscheinungsbild**: Horizontales Scrollen sowie *KDE Breeze Dunkel* / *KDE Breeze Hell*.
+- **Erscheinungsbild**: *KDE Breeze Dunkel* / *KDE Breeze Hell*.
 
 ---
 

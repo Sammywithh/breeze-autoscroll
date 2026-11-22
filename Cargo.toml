@@ -1,6 +1,6 @@
 [package]
 name = "breeze-autoscroll"
-version = "2.0.0"
+version = "2.1.0"
 edition = "2024"
 rust-version = "1.95"
 description = "Windows-style middle-click autoscroll for Kubuntu 26.04 (KDE Plasma 6) with 3D/CAD orbit protection"

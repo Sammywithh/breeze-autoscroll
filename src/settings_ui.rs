@@ -260,10 +260,10 @@ impl eframe::App for SettingsApp {
                             if ui
                                 .radio(
                                     self.draft.mode == "smart",
-                                    "Intelligenter Hybrid-Modus (Empfohlen)",
+                                    "Windows-Automatik: Einrast- & Halte-Modus (Empfohlen)",
                                 )
                                 .on_hover_text(
-                                    "Kurzer Klick bleibt normaler Mittelklick. Stationäres Halten startet Autoscroll.",
+                                    "Klick & Loslassen fixiert den Anker dauerhaft (Einrast-Modus, Stopp per Klick/Esc). Drücken & Ziehen aus der Totzone scrollt nur bis zum Loslassen (Halte-Modus).",
                                 )
                                 .clicked()
                             {
@@ -273,10 +273,10 @@ impl eframe::App for SettingsApp {
                             if ui
                                 .radio(
                                     self.draft.mode == "toggle",
-                                    "Klick zum Umschalten (Toggle)",
+                                    "Immer Einrast-Modus (Toggle)",
                                 )
                                 .on_hover_text(
-                                    "Einmaliger stationärer Mittelklick startet Autoscroll. Nächster Klick stoppt.",
+                                    "Mittelklick fixiert den Anker unabhängig von der Bewegung. Beenden durch erneuten Klick oder Esc.",
                                 )
                                 .clicked()
                             {
@@ -286,7 +286,7 @@ impl eframe::App for SettingsApp {
                             if ui
                                 .radio(
                                     self.draft.mode == "drag",
-                                    "Gedrückt halten & Ziehen (Drag)",
+                                    "Immer Halte-Modus (Drag)",
                                 )
                                 .on_hover_text(
                                     "Autoscroll ist nur aktiv, solange das Mausrad gedrückt gehalten wird.",
@@ -301,7 +301,10 @@ impl eframe::App for SettingsApp {
                             changed |= ui
                                 .checkbox(
                                     &mut self.draft.allow_horizontal,
-                                    "Horizontales 2D-Scrollen erlauben (Links / Rechts)",
+                                    "Horizontales 2D-Scrollen erlauben (4-Wege-Anker inkl. Diagonal)",
+                                )
+                                .on_hover_text(
+                                    "Aktiv: 4-Wege-Anker (Hoch/Runter/Links/Rechts + Diagonal). Deaktiviert: 2-Wege-Anker (nur Vertikal).",
                                 )
                                 .changed();
                         });
@@ -316,22 +319,22 @@ impl eframe::App for SettingsApp {
                             |ui| {
                                 changed |= ui
                                     .checkbox(
-                                        &mut self.draft.protect_3d_drag,
-                                        "3D-Orbit/Pan-Schutz: Beim direkten Ziehen mit gedrücktem Mausrad nicht auslösen",
+                                        &mut self.draft.auto_exclude_3d_apps,
+                                        "In 3D-Programmen & 3D-Websites automatisch deaktivieren",
                                     )
                                     .on_hover_text(
-                                        "Wenn sich der Mauszeiger direkt beim Drücken des Mausrads bewegt (z. B. 3D-Kamera drehen), wird Autoscroll sofort abgebrochen.",
+                                        "Erkennt Fenster unter dem Zeiger sowie aktive Browser-Tabs (z. B. Onshape, Bambu Studio, OrcaSlicer, FreeCAD, Blender) und lässt dort natives 3D-Drehen unberührt.",
                                     )
                                     .changed();
 
                                 ui.add_space(2.0);
                                 changed |= ui
                                     .checkbox(
-                                        &mut self.draft.auto_exclude_3d_apps,
-                                        "In 3D-Programmen & 3D-Websites automatisch deaktivieren",
+                                        &mut self.draft.protect_3d_drag,
+                                        "Strenger Orbit-Schutz: Bei sofortiger Bewegung nicht auslösen (deaktiviert Halte-Modus)",
                                     )
                                     .on_hover_text(
-                                        "Erkennt aktive Fensterklassen und Browser-Tabs (z. B. Onshape, Bambu Studio, OrcaSlicer, FreeCAD, Blender).",
+                                        "Optional für nicht gelistete 3D-Websites: Bricht Autoscroll ab, wenn die Maus beim Gedrückthalten sofort bewegt wird. Hinweis: Deaktiviert den Windows-Halte-Modus (Drücken, Ziehen, Loslassen).",
                                     )
                                     .changed();
 
