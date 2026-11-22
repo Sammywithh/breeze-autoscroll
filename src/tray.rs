@@ -294,13 +294,17 @@ impl AutoscrollControlIface {
         }
     }
 
-    #[zbus(name = "DebugProbe")]
-    fn debug_probe(&self) -> String {
-        let probe = self
-            .state
-            .window_tracker
-            .probe_pointer_and_start_live_cursor();
+    #[zbus(name = "TriggerProbe")]
+    fn trigger_probe(&self) {
+        self.state.window_tracker.trigger_probe();
+    }
+
+    #[zbus(name = "GetLastProbe")]
+    fn get_last_probe(&self) -> String {
         self.state.window_tracker.stop_live_cursor();
+        let Some(probe) = self.state.window_tracker.last_probe_snapshot() else {
+            return "none".to_string();
+        };
         let win_desc = probe
             .window
             .as_ref()

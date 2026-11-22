@@ -423,6 +423,21 @@ impl WindowTracker {
         None
     }
 
+    /// Triggers an asynchronous KWin pointer probe without blocking the caller's D-Bus thread.
+    pub fn trigger_probe(&self) {
+        if let Ok(guard) = self.bridge.lock()
+            && let Some(handle) = guard.as_ref()
+        {
+            let _ = handle.tx.send(BridgeCmd::StartLiveCursorAndProbe);
+        }
+    }
+
+    /// Returns the most recent KWin pointer probe result, if any.
+    pub fn last_probe_snapshot(&self) -> Option<PointerProbeResult> {
+        let (lock, _) = &*self.sync;
+        lock.lock().ok().and_then(|g| g.last_probe.clone())
+    }
+
     /// Unloads the ephemeral KWin live-cursor script once autoscroll stops.
     pub fn stop_live_cursor(&self) {
         if let Ok(guard) = self.bridge.lock()
@@ -924,7 +939,7 @@ const KWIN_CURSOR_LIVE_JS: &str = r#"
             var nx = Math.round(p.x);
             var ny = Math.round(p.y);
             var now = Date.now();
-            if (now - lastSentMs >= 8 || Math.abs(nx - lastX) + Math.abs(ny - lastY) >= 2) {
+            if (now - lastSentMs >= 10 && (nx !== lastX || ny !== lastY)) {
                 lastX = nx;
                 lastY = ny;
                 lastSentMs = now;
