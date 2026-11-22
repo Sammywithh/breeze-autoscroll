@@ -6,20 +6,22 @@
 
 ## 🌟 Übersicht
 
-Unter Windows aktiviert ein Mittelklick (Drücken des Mausrades) auf einer freien Fläche einer scrollbaren Seite den Autoscroll-Modus (Automatisches Bildlaufen / Panning). **Breeze Autoscroll v2.2** setzt dieses Funktionsprinzip exakt und nativ in **Rust** für **Kubuntu 26.04 LTS (KDE Plasma 6)** um:
+Unter Windows aktiviert ein Mittelklick (Drücken des Mausrades) auf einer freien Fläche einer scrollbaren Seite den Autoscroll-Modus (Automatisches Bildlaufen / Panning). **Breeze Autoscroll v2.3** setzt dieses Funktionsprinzip exakt und nativ in **Rust** für **Kubuntu 26.04 LTS (KDE Plasma 6)** um:
 
 - 🎯 **Ankerpunkt und Vektorsteuerung (2-Wege & 4-Wege)**:
-  - Beim Drücken des Mausrades auf einer **nicht-interaktiven Stelle** der Seite erscheint an der exakten Klickposition (auch unter KDE Plasma 6 Wayland Multi-Monitor) ein feststehendes Ankersymbol mit Mittelpunkt und **2 Pfeilen** (Hoch/Runter) bzw. **4 Pfeilen** (wenn horizontales 2D-Scrollen aktiviert ist).
+  - Beim Auslösen auf einer **nicht-interaktiven Stelle** der Seite erscheint an der exakten Klickposition (auch unter KDE Plasma 6 Wayland Multi-Monitor) ein feststehendes Ankersymbol mit Mittelpunkt und **2 Pfeilen** (Hoch/Runter) bzw. **4 Pfeilen** (wenn horizontales 2D-Scrollen aktiviert ist).
   - **Totzone (Stillstand)**: Solange der Mauszeiger direkt auf dem Ankersymbol innerhalb der Totzone bleibt, steht die Ansicht still.
   - **Richtung & Diagonal**: Bewegt man die Maus vom Anker weg, scrollt die Ansicht exakt in diese Richtung – bei aktiviertem 4-Wege-Anker stufenlos in alle Richtungen inkl. diagonal.
   - **Progressive Geschwindigkeit**: Kleine Abstände ermöglichen langsames, ruhiges Mitlesen; größere Abstände beschleunigen nicht-linear für schnelles Durchscrollen.
-- 🔗 **Schutz interaktiver Elemente (Browser-Tabs, Hyperlinks & Dateimanager/Dolphin)**:
-  - **Browser-Tableiste, Adressleiste & Titelleisten**: Erkennt über KWin die Fenster- und Client-Geometrie und ignoriert Mittelklicks auf Browser-Tabs (zum Schließen von Tabs in Firefox, Brave, Chrome, Chromium, Edge, Vivaldi, Zen etc.), Adress-/Symbolleisten sowie Fenstertitelleisten.
-  - **Hyperlinks & Buttons**: Prüft über die Linux DRM Hardware-Cursor-Plane (Wayland) bzw. XFixes (X11) den aktiven Cursor-Hotspot (`pointer` / `pointing_hand`) und verhindert das Auslösen von Autoscroll, wenn ein Hyperlink (`<a href="...">`) per Mittelklick in einem neuen Tab geöffnet wird.
-  - **Dateimanager (Dolphin) & native KDE/Qt/GTK-Apps**: Prüft per AT-SPI2-Hit-Test in `< 2 ms` das Element direkt unter dem Mauszeiger. Mittelklicks auf Ordner/Dateien (z. B. Ordner im neuen Tab öffnen), Dolphin-Tabs, Adress-/Pfadleiste oder Einträge in der Orte-Seitenleiste lösen kein Autoscroll aus – auf freien Flächen dazwischen startet Autoscroll wie gewohnt.
-- 🔄 **Automatische Erkennung der zwei Windows-Bedienmodi**:
-  - **Einrast-Modus (Klick und loslassen)**: Ein kurzes Drücken und sofortiges Loslassen des Mausrades in der Totzone fixiert den Anker dauerhaft. Beendet wird per beliebigem Mausklick (links, rechts oder mitte), physischem Mausrad oder `ESC`.
-  - **Halte-Modus (Drücken, ziehen, loslassen)**: Hält man das Mausrad gedrückt und zieht den Zeiger direkt aus der Totzone heraus, scrollt die Seite genau so lange, wie die Taste gehalten wird. Beim Loslassen verschwindet der Anker sofort.
+- 🌐 **Systemweiter Schutz interaktiver Mittelklicks (in ALLEN Linux-Apps)**:
+  - **Kurze Mittelklicks systemweit durchreichen (Standard aktiv)**: Da Linux/Wayland, Electron (Obsidian, VS Code, Discord) und GTK4 (Nautilus) nicht universell melden, ob ein Mittelklick ein UI-Element ausgelöst hat, lässt Breeze Autoscroll kurze, stationäre Mittelklicks (`< 180 ms` innerhalb der Totzone) systemweit ohne Anker-Aufblitzen direkt an die jeweilige Anwendung durch – Tabs schließen, Links/Ordner im neuen Tab öffnen und Mittelklick-Einfügen funktionieren dadurch universell in **jeder** App.
+  - **Zusätzlicher Mehrschicht-Schutz (Defense-in-Depth)**:
+    - Generische **CSD-Headerbar-/Tab-Leisten-Erkennung** (`48 px` bei rahmenlosen Electron/GTK4-Apps wie Obsidian, Nautilus, VS Code) sowie Browser-Tableisten & Fenstertitelleisten via KWin.
+    - **Hyperlink-Cursor-Erkennung** (`pointing_hand`) über die Linux DRM Hardware-Cursor-Plane (Wayland) bzw. XFixes (X11).
+    - **AT-SPI2-Hit-Test** (`< 2 ms`) für native KDE/Qt- und unterstützte GTK-Anwendungen (z. B. Dolphin-Ordner, Tabs & Seitenleiste).
+- 🔄 **Automatische Erkennung der zwei Bedienmodi**:
+  - **Halte-Modus (sofortiges Drücken & Ziehen)**: Hält man das Mausrad gedrückt und zieht den Zeiger direkt aus der Totzone heraus, aktiviert sich Autoscroll **sofort** (ohne Wartezeit) und verschwindet beim Loslassen sofort wieder.
+  - **Einrast-Modus (kurz gedrückt halten & loslassen)**: Hält man das Mausrad kurz (`~180 ms`, konfigurierbar) ruhig an einer Stelle und lässt es in der Totzone los, rastet der Anker dauerhaft ein. Beendet wird per beliebigem Mausklick (links, rechts oder mitte), physischem Mausrad oder `ESC`. (Optional lässt sich der kurze Durchreich-Schutz in den Einstellungen auch abschalten.)
 - 🛡️ **3D / CAD & Slicer Schutz (Onshape, Bambu Studio, etc.)**:
   - Erkennt automatisch das Fenster direkt unter dem Klick sowie aktive Browser-Tabs via KDE KWin & X11 und lässt natives 3D-Orbit/Pan in **Onshape**, **Bambu Studio**, **OrcaSlicer**, **PrusaSlicer**, **Cura**, **FreeCAD**, **Blender**, **KiCad**, **Tinkercad** und **Sketchfab** vollständig unberührt.
   - Optional lässt sich in den Einstellungen zusätzlich ein strenger Orbit-Schutz für nicht gelistete 3D-Websites aktivieren.
@@ -47,7 +49,7 @@ Alternativ kannst du ein Debian-Paket (`.deb`) erstellen oder direkt installiere
 
 ```bash
 ./build_deb.sh
-sudo apt install ./breeze-autoscroll_2.2.1_amd64.deb
+sudo apt install ./breeze-autoscroll_2.3.0_amd64.deb
 ```
 
 ---
@@ -55,8 +57,9 @@ sudo apt install ./breeze-autoscroll_2.2.1_amd64.deb
 ## 📖 Bedienung
 
 ### 1. Autoscroll auslösen
-- **Einrast-Modus**: Mausrad kurz drücken und innerhalb der Totzone sofort loslassen $\rightarrow$ Anker bleibt fixiert; Beenden durch Links-, Rechts- oder Mittelklick, physisches Mausrad oder `ESC`.
-- **Halte-Modus**: Mausrad drücken, Zeiger direkt aus der Totzone ziehen und zum Beenden einfach wieder loslassen.
+- **Kurzer Mittelklick (`< 180 ms`)**: Wird systemweit als normaler Mittelklick durchgereicht (Tabs schließen, Links/Ordner im neuen Tab öffnen, Einfügen in jeder Anwendung).
+- **Halte-Modus (sofort)**: Mausrad drücken, Zeiger direkt aus der Totzone ziehen und zum Beenden einfach wieder loslassen – startet ohne Verzögerung.
+- **Einrast-Modus**: Mausrad kurz (`~180 ms`, bis der Anker erscheint) in der Totzone gedrückt halten und loslassen $\rightarrow$ Anker bleibt fixiert; Beenden durch Links-, Rechts- oder Mittelklick, physisches Mausrad oder `ESC`.
 - **3D-Programme & CAD**: In erkannten 3D-Anwendungen und 3D-Browser-Tabs (z. B. Onshape, Bambu Studio) bleibt das Mittelklick-Drehen automatisch nativ erhalten.
 
 ---
@@ -71,6 +74,7 @@ breeze-autoscroll --settings
 
 ### Optionen im Überblick:
 - **Mausrad-Klick Verhalten**: *Windows-Automatik (Einrast- & Halte-Modus, Standard)*, *Immer Einrast-Modus (Toggle)* oder *Immer Halte-Modus (Drag)*.
+- **Systemweiter Schutz für kurze Mittelklicks**: *Kurze Mittelklicks systemweit durchreichen* (Standard aktiv) + einstellbare Haltezeit für den Einrast-Modus (`100 ms`–`400 ms`, Standard `180 ms`).
 - **Anker-Typ**: *4-Wege-Anker inkl. Diagonal* (wenn horizontales 2D-Scrollen aktiviert) oder *2-Wege-Anker* (nur Vertikal).
 - **3D-Raum, CAD & Slicer Schutz**:
   - Automatische Deaktivierung in 3D-Apps & 3D-Websites + frei bearbeitbare Liste ausgeschlossener Apps und Fenstertitel-Keywords.

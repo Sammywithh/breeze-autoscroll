@@ -17,7 +17,7 @@ fi
 
 # 2. Kill running processes (Rust & legacy Python)
 pkill -x "breeze-autoscro" 2>/dev/null || true
-pkill -f "/breeze-autoscroll($| )" 2>/dev/null || true
+pkill -f "^([^[:space:]]*/)?breeze-autoscroll($| )" 2>/dev/null || true
 pkill -f "breeze-autoscroll/src/main.py" 2>/dev/null || true
 
 # 3. Remove installed files

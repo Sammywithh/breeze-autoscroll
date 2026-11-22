@@ -14,7 +14,7 @@ SHARE_DIR="${HOME}/.local/share/breeze-autoscroll"
 TARGET_BIN="${BIN_DIR}/breeze-autoscroll"
 
 echo "============================================================"
-echo "  Breeze Autoscroll v2.0 (Rust) - Installation für Kubuntu 26.04"
+echo "  Breeze Autoscroll v2.3 (Rust) - Installation für Kubuntu 26.04"
 echo "============================================================"
 echo ""
 
@@ -43,7 +43,7 @@ echo "[2/5] Stoppe eventuell laufende alte Prozesse..."
 systemctl --user stop breeze-autoscroll.service 2>/dev/null || true
 pkill -f "breeze-autoscroll/src/main.py" 2>/dev/null || true
 pkill -x "breeze-autoscro" 2>/dev/null || true
-pkill -f "/breeze-autoscroll($| )" 2>/dev/null || true
+pkill -f "^([^[:space:]]*/)?breeze-autoscroll($| )" 2>/dev/null || true
 sleep 0.2
 rm -rf "${SHARE_DIR}"
 
