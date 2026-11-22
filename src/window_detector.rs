@@ -25,8 +25,9 @@ use crate::config::ConfigData;
 const KWIN_TRACKER_SCRIPT_NAME: &str = "breeze_autoscroll_tracker";
 const KWIN_CURSOR_LIVE_SCRIPT_NAME: &str = "breeze_autoscroll_cursor_live";
 const PROBE_TIMEOUT_MS: u64 = 80;
-/// Client-side headerbar height for frameless non-browser CSD applications (GTK4/Libadwaita/Electron).
-const CSD_HEADERBAR_HEIGHT_PX: i32 = 38;
+/// Client-side headerbar / tab strip height for frameless CSD applications
+/// (GTK4/Libadwaita, Electron apps like Obsidian/VS Code/Discord, etc.).
+const CSD_HEADERBAR_HEIGHT_PX: i32 = 48;
 /// Fallback top toolbar + tab bar height for tabbed file managers (Dolphin, Nautilus, etc.)
 /// if AT-SPI2 hit-testing is unavailable.
 const FILE_MANAGER_TOP_CHROME_PX: i32 = 86;
@@ -1973,5 +1974,30 @@ mod tests {
         };
         assert!(is_interactive_window_chrome(&tab_fallback_probe, &cfg));
         assert!(tracker.is_interactive_probe(&tab_fallback_probe, &cfg));
+
+        // 4. Generic frameless CSD app (e.g. Obsidian, Nautilus, VS Code, any Electron/GTK4 app)
+        // protects top 48px tab/header bar without needing app-specific names
+        let generic_csd_tab_probe = PointerProbeResult {
+            cursor_x: 2200,
+            cursor_y: 162, // rel_y = 42 < 48
+            overlay_x: 2200,
+            overlay_y: 162,
+            window: Some(ActiveWindowInfo {
+                app_class: "arbitrary-csd-app".to_string(),
+                app_name: "arbitrary-csd-app".to_string(),
+                desktop_file: "arbitrary-csd-app".to_string(),
+                title: "Willkommen".to_string(),
+                updated_at_ms: 0,
+            }),
+            win_x: 1920,
+            win_y: 120,
+            win_w: 1400,
+            win_h: 900,
+            no_border: true,
+            from_kwin: true,
+            ..Default::default()
+        };
+        assert!(is_interactive_window_chrome(&generic_csd_tab_probe, &cfg));
+        assert!(tracker.is_interactive_probe(&generic_csd_tab_probe, &cfg));
     }
 }
