@@ -6,13 +6,16 @@
 
 ## 🌟 Übersicht
 
-Unter Windows aktiviert ein Mittelklick (Drücken des Mausrades) auf einer freien Fläche einer scrollbaren Seite den Autoscroll-Modus (Automatisches Bildlaufen / Panning). **Breeze Autoscroll v2.1** setzt dieses Funktionsprinzip exakt und nativ in **Rust** für **Kubuntu 26.04 LTS (KDE Plasma 6)** um:
+Unter Windows aktiviert ein Mittelklick (Drücken des Mausrades) auf einer freien Fläche einer scrollbaren Seite den Autoscroll-Modus (Automatisches Bildlaufen / Panning). **Breeze Autoscroll v2.2** setzt dieses Funktionsprinzip exakt und nativ in **Rust** für **Kubuntu 26.04 LTS (KDE Plasma 6)** um:
 
 - 🎯 **Ankerpunkt und Vektorsteuerung (2-Wege & 4-Wege)**:
-  - Beim Drücken des Mausrades erscheint an der exakten Klickposition (auch unter KDE Plasma 6 Wayland Multi-Monitor) ein feststehendes Ankersymbol mit Mittelpunkt und **2 Pfeilen** (Hoch/Runter) bzw. **4 Pfeilen** (wenn horizontales 2D-Scrollen aktiviert ist).
+  - Beim Drücken des Mausrades auf einer **nicht-interaktiven Stelle** der Seite erscheint an der exakten Klickposition (auch unter KDE Plasma 6 Wayland Multi-Monitor) ein feststehendes Ankersymbol mit Mittelpunkt und **2 Pfeilen** (Hoch/Runter) bzw. **4 Pfeilen** (wenn horizontales 2D-Scrollen aktiviert ist).
   - **Totzone (Stillstand)**: Solange der Mauszeiger direkt auf dem Ankersymbol innerhalb der Totzone bleibt, steht die Ansicht still.
   - **Richtung & Diagonal**: Bewegt man die Maus vom Anker weg, scrollt die Ansicht exakt in diese Richtung – bei aktiviertem 4-Wege-Anker stufenlos in alle Richtungen inkl. diagonal.
   - **Progressive Geschwindigkeit**: Kleine Abstände ermöglichen langsames, ruhiges Mitlesen; größere Abstände beschleunigen nicht-linear für schnelles Durchscrollen.
+- 🔗 **Schutz interaktiver Elemente (Browser-Tabs & Hyperlinks)**:
+  - **Browser-Tableiste, Adressleiste & Titelleisten**: Erkennt über KWin die Fenster- und Client-Geometrie und ignoriert Mittelklicks auf Browser-Tabs (zum Schließen von Tabs in Firefox, Brave, Chrome, Chromium, Edge, Vivaldi, Zen etc.), Adress-/Symbolleisten sowie Fenstertitelleisten.
+  - **Hyperlinks & Buttons**: Prüft über die Linux DRM Hardware-Cursor-Plane (Wayland) bzw. XFixes (X11) den aktiven Cursor-Hotspot (`pointer` / `pointing_hand`) und verhindert das Auslösen von Autoscroll, wenn ein Hyperlink (`<a href="...">`) per Mittelklick in einem neuen Tab geöffnet wird.
 - 🔄 **Automatische Erkennung der zwei Windows-Bedienmodi**:
   - **Einrast-Modus (Klick und loslassen)**: Ein kurzes Drücken und sofortiges Loslassen des Mausrades in der Totzone fixiert den Anker dauerhaft. Beendet wird per beliebigem Mausklick (links, rechts oder mitte), physischem Mausrad oder `ESC`.
   - **Halte-Modus (Drücken, ziehen, loslassen)**: Hält man das Mausrad gedrückt und zieht den Zeiger direkt aus der Totzone heraus, scrollt die Seite genau so lange, wie die Taste gehalten wird. Beim Loslassen verschwindet der Anker sofort.
@@ -43,7 +46,7 @@ Alternativ kannst du ein Debian-Paket (`.deb`) erstellen oder direkt installiere
 
 ```bash
 ./build_deb.sh
-sudo apt install ./breeze-autoscroll_2.1.0_amd64.deb
+sudo apt install ./breeze-autoscroll_2.2.0_amd64.deb
 ```
 
 ---

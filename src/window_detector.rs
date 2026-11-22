@@ -1477,6 +1477,7 @@ const KWIN_CURSOR_LIVE_JS: &str = r#"
         lastY = cy;
         lastSentMs = Date.now();
 
+        var coords = String(cx) + "," + String(cy) + "," + String(vw) + "," + String(vh);
         var winGeom = String(wx) + "," + String(wy) + "," + String(ww) + "," + String(wh) + "," + isFullScreen + "," + noBorder;
         var screenGeom = String(sx) + "," + String(sy) + "," + sScale;
 
@@ -1485,8 +1486,7 @@ const KWIN_CURSOR_LIVE_JS: &str = r#"
             "/Autoscroll",
             "org.breeze.Autoscroll",
             "ReportPointerProbe",
-            String(cx), String(cy),
-            String(vw), String(vh),
+            coords,
             cls, name, desktop, caption, isDockOrDesktop,
             winGeom, screenGeom
         );

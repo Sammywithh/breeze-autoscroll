@@ -256,10 +256,7 @@ impl AutoscrollControlIface {
     #[zbus(name = "ReportPointerProbe")]
     fn report_pointer_probe(
         &self,
-        cursor_x: String,
-        cursor_y: String,
-        virt_w: String,
-        virt_h: String,
+        coords: String,
         app_class: String,
         app_name: String,
         desktop_file: String,
@@ -268,10 +265,11 @@ impl AutoscrollControlIface {
         win_geom: String,
         screen_geom: String,
     ) {
-        let cx = cursor_x.trim().parse::<i32>().unwrap_or(0);
-        let cy = cursor_y.trim().parse::<i32>().unwrap_or(0);
-        let vw = virt_w.trim().parse::<i32>().unwrap_or(0);
-        let vh = virt_h.trim().parse::<i32>().unwrap_or(0);
+        let mut coord_parts = coords.split(',');
+        let cx = coord_parts.next().and_then(|s| s.trim().parse::<i32>().ok()).unwrap_or(0);
+        let cy = coord_parts.next().and_then(|s| s.trim().parse::<i32>().ok()).unwrap_or(0);
+        let vw = coord_parts.next().and_then(|s| s.trim().parse::<i32>().ok()).unwrap_or(0);
+        let vh = coord_parts.next().and_then(|s| s.trim().parse::<i32>().ok()).unwrap_or(0);
         let dock_or_desktop = is_dock_or_desktop.trim() == "1";
 
         let mut win_parts = win_geom.split(',');
