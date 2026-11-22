@@ -40,8 +40,11 @@ fi
 
 # 3. Stop any running instance (legacy Python or older Rust binary)
 echo "[2/5] Stoppe eventuell laufende alte Prozesse..."
+systemctl --user stop breeze-autoscroll.service 2>/dev/null || true
 pkill -f "breeze-autoscroll/src/main.py" 2>/dev/null || true
-pkill -x "breeze-autoscroll" 2>/dev/null || true
+pkill -x "breeze-autoscro" 2>/dev/null || true
+pkill -f "/breeze-autoscroll($| )" 2>/dev/null || true
+sleep 0.2
 rm -rf "${SHARE_DIR}"
 
 # Install native binary
