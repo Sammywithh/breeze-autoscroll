@@ -466,15 +466,9 @@ impl WindowTracker {
         match_excluded_3d_context(&active, &config.excluded_apps_and_titles)
     }
 
-    /// Legacy cursor helper retained until Step 2 switches input_manager to pointer probing.
-    #[allow(dead_code)]
-    pub fn get_cursor_pos(&self) -> (i32, i32) {
-        let probe = self.probe_pointer_and_start_live_cursor();
-        (probe.overlay_x, probe.overlay_y)
-    }
-
     /// Checks whether the currently active application or browser tab belongs to an
     /// excluded 3D/CAD/Slicer context.
+    #[cfg(test)]
     pub fn check_excluded_context(&self, config: &ConfigData) -> Option<String> {
         if !config.auto_exclude_3d_apps || config.excluded_apps_and_titles.is_empty() {
             return None;

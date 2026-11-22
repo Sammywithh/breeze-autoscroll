@@ -616,6 +616,7 @@ fn run_indicator_loop(rx: Receiver<IndicatorCommand>) {
                 deadzone,
                 theme,
                 opacity,
+                allow_horizontal: _,
             } => {
                 if overlay.is_none() {
                     overlay = X11OverlayWindow::new();

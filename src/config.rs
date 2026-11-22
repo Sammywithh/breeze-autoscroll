@@ -10,6 +10,11 @@ use std::sync::{Arc, RwLock};
 
 use serde::{Deserialize, Serialize};
 
+/// Current configuration schema version.
+/// Version 2 switches default interaction to authentic Windows autoscroll
+/// (`protect_3d_drag = false`, keeping `auto_exclude_3d_apps = true`).
+pub const CURRENT_CONFIG_VERSION: u32 = 2;
+
 /// Default list of 3D CAD programs, slicers, engines, and browser 3D websites
 /// where middle-click drag is used for 3D orbit/pan navigation.
 pub fn default_excluded_apps_and_titles() -> Vec<String> {
@@ -48,6 +53,9 @@ pub fn default_excluded_apps_and_titles() -> Vec<String> {
     .collect()
 }
 
+fn default_zero_u32() -> u32 {
+    0
+}
 fn default_true() -> bool {
     true
 }
@@ -89,6 +97,9 @@ fn default_hold_delay_ms() -> u64 {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct ConfigData {
+    #[serde(default = "default_zero_u32")]
+    pub config_version: u32,
+
     #[serde(default = "default_true")]
     pub enabled: bool,
 
@@ -136,9 +147,9 @@ pub struct ConfigData {
     #[serde(default = "default_tick_interval_ms")]
     pub tick_interval_ms: u64,
 
-    /// Abort autoscroll activation if the mouse moves immediately while BTN_MIDDLE is held
-    /// (prevents interrupting 3D orbit/pan drags in CAD/slicers/browsers).
-    #[serde(default = "default_true")]
+    /// Optional legacy guard: abort autoscroll activation if the mouse moves immediately while
+    /// BTN_MIDDLE is held (disables Windows Halte-Modus drag-out activation).
+    #[serde(default = "default_false")]
     pub protect_3d_drag: bool,
 
     /// Movement threshold in pixels during the pending hold phase that cancels autoscroll.
@@ -161,6 +172,7 @@ pub struct ConfigData {
 impl Default for ConfigData {
     fn default() -> Self {
         Self {
+            config_version: CURRENT_CONFIG_VERSION,
             enabled: default_true(),
             mode: default_mode(),
             deadzone: default_deadzone(),
@@ -174,7 +186,7 @@ impl Default for ConfigData {
             indicator_opacity: default_indicator_opacity(),
             autostart: default_true(),
             tick_interval_ms: default_tick_interval_ms(),
-            protect_3d_drag: default_true(),
+            protect_3d_drag: default_false(),
             drag_cancel_threshold_px: default_drag_cancel_threshold_px(),
             hold_delay_ms: default_hold_delay_ms(),
             auto_exclude_3d_apps: default_true(),
@@ -261,9 +273,17 @@ impl ConfigManager {
             match fs::read_to_string(&self.config_file) {
                 Ok(content) => match serde_json::from_str::<ConfigData>(&content) {
                     Ok(mut parsed) => {
+                        let needs_migration = parsed.config_version < CURRENT_CONFIG_VERSION;
+                        if needs_migration {
+                            parsed.protect_3d_drag = false;
+                            parsed.config_version = CURRENT_CONFIG_VERSION;
+                        }
                         parsed.normalize();
                         if let Ok(mut guard) = self.data.write() {
                             *guard = parsed;
+                        }
+                        if needs_migration {
+                            self.save();
                         }
                     }
                     Err(err) => {
@@ -402,12 +422,13 @@ mod tests {
         let cfg = mgr.snapshot();
 
         assert!(cfg.enabled);
+        assert_eq!(cfg.config_version, CURRENT_CONFIG_VERSION);
         assert_eq!(cfg.mode, "smart");
         assert_eq!(cfg.deadzone, 12);
         assert!((cfg.scroll_speed - 1.0).abs() < 1e-5);
         assert!(cfg.allow_horizontal);
         assert_eq!(cfg.theme, "dark");
-        assert!(cfg.protect_3d_drag);
+        assert!(!cfg.protect_3d_drag);
         assert!(cfg.auto_exclude_3d_apps);
         assert!(cfg.excluded_apps_and_titles.iter().any(|s| s == "onshape"));
         assert!(
@@ -443,14 +464,48 @@ mod tests {
         let mgr = ConfigManager::new(Some(dir.clone()));
         let cfg = mgr.snapshot();
 
+        assert_eq!(cfg.config_version, CURRENT_CONFIG_VERSION);
         assert_eq!(cfg.deadzone, 14);
         assert!((cfg.scroll_speed - 0.72).abs() < 1e-5);
         assert!(!cfg.allow_horizontal);
         assert!(!cfg.autostart);
-        assert!(cfg.protect_3d_drag);
+        assert!(!cfg.protect_3d_drag);
         assert!(cfg.auto_exclude_3d_apps);
         assert!((cfg.drag_cancel_threshold_px - 5.0).abs() < 1e-5);
         assert_eq!(cfg.hold_delay_ms, 180);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn migrates_v1_config_with_protect_3d_drag_true_preserving_user_settings() {
+        let dir = temp_config_dir("migrate_v1");
+        let v1_json = r#"{
+            "enabled": true,
+            "mode": "smart",
+            "deadzone": 12,
+            "scroll_speed": 0.5,
+            "scroll_curve_exponent": 1.3,
+            "allow_horizontal": false,
+            "autostart": false,
+            "protect_3d_drag": true,
+            "auto_exclude_3d_apps": true
+        }"#;
+        fs::write(dir.join("config.json"), v1_json).unwrap();
+
+        let mgr = ConfigManager::new(Some(dir.clone()));
+        let cfg = mgr.snapshot();
+        assert_eq!(cfg.config_version, CURRENT_CONFIG_VERSION);
+        assert!(!cfg.protect_3d_drag);
+        assert!(cfg.auto_exclude_3d_apps);
+        assert!((cfg.scroll_speed - 0.5).abs() < 1e-5);
+        assert!(!cfg.allow_horizontal);
+        assert!(!cfg.autostart);
+
+        // Once migrated to v2, an explicit user opt-in to protect_3d_drag is preserved
+        mgr.update(true, |c| c.protect_3d_drag = true);
+        let reloaded = ConfigManager::new(Some(dir.clone()));
+        assert!(reloaded.snapshot().protect_3d_drag);
 
         let _ = fs::remove_dir_all(&dir);
     }

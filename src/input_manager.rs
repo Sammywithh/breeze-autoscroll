@@ -13,7 +13,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use crate::config::{ConfigData, ConfigManager};
-use crate::window_detector::WindowTracker;
+use crate::window_detector::{WindowTracker, is_wayland_session};
 
 // ============================================================================
 // Linux Kernel evdev / uinput ABI constants (x86_64 / generic Linux)
@@ -126,6 +126,7 @@ pub enum IndicatorCommand {
         deadzone: u32,
         theme: String,
         opacity: f32,
+        allow_horizontal: bool,
     },
     UpdateOffset {
         delta_x: f32,
@@ -282,9 +283,7 @@ unsafe fn ioctl_check(
 const HI_RES_STEP_QUANTUM: i32 = 15;
 const HI_RES_PER_NOTCH: i32 = 120;
 
-/// Distance moved while middle button is held before releasing to distinguish click-toggle vs drag.
-const SMART_LATCH_MAX_DIST_PX: f32 = 20.0;
-const SMART_LATCH_MAX_ACTIVE_MS: u64 = 350;
+/// Maximum click duration in dedicated `"toggle"` mode if `protect_3d_drag` is enabled.
 const TOGGLE_CLICK_MAX_MS: u64 = 300;
 /// Ignore accidental physical wheel jitter immediately after BTN_MIDDLE press (wobbly wheel click).
 const WHEEL_CANCEL_GRACE_MS: u64 = 150;
@@ -292,14 +291,15 @@ const WHEEL_CANCEL_GRACE_MS: u64 = 150;
 #[derive(Debug, Clone, PartialEq)]
 enum ScrollPhase {
     Idle,
-    /// Middle button was pressed on a non-excluded window; waiting to distinguish:
-    /// - Quick middle click (< hold_delay_ms)
-    /// - 3D Orbit/Pan drag (mouse moves >= drag_cancel_threshold_px while held)
-    /// - Intentional stationary hold for Autoscroll (>= hold_delay_ms without drag)
+    /// Optional legacy guard mode (`protect_3d_drag = true`): waits `hold_delay_ms`
+    /// and cancels if dragged immediately.
     Pending {
         pressed_at: Instant,
         anchor_x: i32,
         anchor_y: i32,
+        overlay_x: i32,
+        overlay_y: i32,
+        live_cursor_available: bool,
         move_x: f32,
         move_y: f32,
     },
@@ -310,7 +310,10 @@ enum ScrollPhase {
         anchor_y: i32,
         delta_x: f32,
         delta_y: f32,
-        toggle_latched: bool,
+        button_held: bool,
+        exited_deadzone_while_held: bool,
+        live_cursor_available: bool,
+        using_absolute_cursor: bool,
         accum_hires_x: f32,
         accum_hires_y: f32,
         pending_std_hires_x: i32,
@@ -348,14 +351,28 @@ impl ScrollStateMachine {
         matches!(self.phase, ScrollPhase::Active { .. })
     }
 
+    pub fn uses_live_cursor(&self) -> bool {
+        matches!(
+            self.phase,
+            ScrollPhase::Active {
+                live_cursor_available: true,
+                ..
+            }
+        )
+    }
+
     /// Handles `BTN_MIDDLE` press.
     ///
-    /// Returns `Some(IndicatorCommand::Hide)` if an active toggle session was stopped.
+    /// In standard Windows mode (`protect_3d_drag == false`), shows the anchor immediately at
+    /// `overlay_pos` and distinguishes Einrast-Modus vs Halte-Modus automatically by whether
+    /// the pointer leaves the deadzone while `BTN_MIDDLE` is held.
     pub fn on_middle_down<F>(
         &mut self,
         now: Instant,
         config: &ConfigData,
         cursor_pos: (i32, i32),
+        overlay_pos: (i32, i32),
+        live_cursor_available: bool,
         is_excluded_context: F,
     ) -> Option<IndicatorCommand>
     where
@@ -365,7 +382,7 @@ impl ScrollStateMachine {
             return self.force_stop();
         }
 
-        // Pressing middle button while active always stops autoscroll.
+        // Pressing middle button while active always stops autoscroll (Einrast-Modus exit).
         if self.is_active() {
             return self.force_stop();
         }
@@ -374,23 +391,76 @@ impl ScrollStateMachine {
             return None;
         }
 
-        // Layer 2 protection: completely ignore middle-click in excluded 3D/CAD/Slicer windows
-        // and excluded browser tabs (e.g. Onshape, Bambu Studio, OrcaSlicer, Blender, FreeCAD).
+        // Exclude recognized 3D/CAD/Slicer apps, browser tabs, docks, and desktop background.
         if let Some(_matched) = is_excluded_context() {
             return None;
         }
 
-        self.phase = ScrollPhase::Pending {
-            pressed_at: now,
+        if config.protect_3d_drag {
+            self.phase = ScrollPhase::Pending {
+                pressed_at: now,
+                anchor_x: cursor_pos.0,
+                anchor_y: cursor_pos.1,
+                overlay_x: overlay_pos.0,
+                overlay_y: overlay_pos.1,
+                live_cursor_available,
+                move_x: 0.0,
+                move_y: 0.0,
+            };
+            return None;
+        }
+
+        self.phase = ScrollPhase::Active {
+            started_at: now,
+            last_tick_at: now,
             anchor_x: cursor_pos.0,
             anchor_y: cursor_pos.1,
-            move_x: 0.0,
-            move_y: 0.0,
+            delta_x: 0.0,
+            delta_y: 0.0,
+            button_held: true,
+            exited_deadzone_while_held: false,
+            live_cursor_available,
+            using_absolute_cursor: false,
+            accum_hires_x: 0.0,
+            accum_hires_y: 0.0,
+            pending_std_hires_x: 0,
+            pending_std_hires_y: 0,
         };
-        None
+
+        Some(IndicatorCommand::Show {
+            anchor_x: overlay_pos.0,
+            anchor_y: overlay_pos.1,
+            deadzone: config.deadzone,
+            theme: config.theme.clone(),
+            opacity: config.indicator_opacity,
+            allow_horizontal: config.allow_horizontal,
+        })
     }
 
-    /// Handles raw relative mouse movement (`REL_X`, `REL_Y`).
+    /// Updates pointer offset from live compositor / X11 coordinates (`cur - anchor`),
+    /// eliminating drift when returning to the anchor symbol.
+    pub fn set_absolute_cursor(&mut self, cur_x: i32, cur_y: i32, config: &ConfigData) {
+        if let ScrollPhase::Active {
+            anchor_x,
+            anchor_y,
+            delta_x,
+            delta_y,
+            button_held,
+            exited_deadzone_while_held,
+            using_absolute_cursor,
+            ..
+        } = &mut self.phase
+        {
+            *using_absolute_cursor = true;
+            *delta_x = (cur_x - *anchor_x) as f32;
+            *delta_y = (cur_y - *anchor_y) as f32;
+            if *button_held && is_outside_deadzone(*delta_x, *delta_y, config) {
+                *exited_deadzone_while_held = true;
+            }
+        }
+    }
+
+    /// Handles raw relative mouse movement (`REL_X`, `REL_Y`) from `evdev`.
     pub fn on_mouse_move(&mut self, dx: f32, dy: f32, config: &ConfigData) {
         match &mut self.phase {
             ScrollPhase::Idle => {}
@@ -398,9 +468,6 @@ impl ScrollStateMachine {
                 *move_x += dx;
                 *move_y += dy;
 
-                // Layer 1 protection: if the user immediately drags while holding BTN_MIDDLE,
-                // this is a native Middle-Mouse Drag (3D Orbit / Camera Pan / Canvas Drag),
-                // NOT a stationary autoscroll hold! Abort pending immediately.
                 if config.protect_3d_drag {
                     let dist = move_x.hypot(*move_y);
                     if dist >= config.drag_cancel_threshold_px {
@@ -409,10 +476,20 @@ impl ScrollStateMachine {
                 }
             }
             ScrollPhase::Active {
-                delta_x, delta_y, ..
+                delta_x,
+                delta_y,
+                button_held,
+                exited_deadzone_while_held,
+                using_absolute_cursor,
+                ..
             } => {
-                *delta_x += dx;
-                *delta_y += dy;
+                if !*using_absolute_cursor {
+                    *delta_x += dx;
+                    *delta_y += dy;
+                    if *button_held && is_outside_deadzone(*delta_x, *delta_y, config) {
+                        *exited_deadzone_while_held = true;
+                    }
+                }
             }
         }
     }
@@ -429,20 +506,24 @@ impl ScrollStateMachine {
                 pressed_at,
                 anchor_x,
                 anchor_y,
+                overlay_x,
+                overlay_y,
+                live_cursor_available,
                 move_x,
                 move_y,
             } => {
                 let held = now.saturating_duration_since(*pressed_at);
                 let dist = move_x.hypot(*move_y);
 
-                // In dedicated "toggle" mode, a crisp stationary click (< 300ms, < drag threshold)
-                // latches autoscroll open upon release.
                 if config.mode == "toggle"
                     && held < Duration::from_millis(TOGGLE_CLICK_MAX_MS)
                     && dist < config.drag_cancel_threshold_px
                 {
                     let ax = *anchor_x;
                     let ay = *anchor_y;
+                    let ox = *overlay_x;
+                    let oy = *overlay_y;
+                    let live_ok = *live_cursor_available;
                     self.phase = ScrollPhase::Active {
                         started_at: now,
                         last_tick_at: now,
@@ -450,61 +531,54 @@ impl ScrollStateMachine {
                         anchor_y: ay,
                         delta_x: 0.0,
                         delta_y: 0.0,
-                        toggle_latched: true,
+                        button_held: false,
+                        exited_deadzone_while_held: false,
+                        live_cursor_available: live_ok,
+                        using_absolute_cursor: false,
                         accum_hires_x: 0.0,
                         accum_hires_y: 0.0,
                         pending_std_hires_x: 0,
                         pending_std_hires_y: 0,
                     };
                     return Some(IndicatorCommand::Show {
-                        anchor_x: ax,
-                        anchor_y: ay,
+                        anchor_x: ox,
+                        anchor_y: oy,
                         deadzone: config.deadzone,
                         theme: config.theme.clone(),
                         opacity: config.indicator_opacity,
+                        allow_horizontal: config.allow_horizontal,
                     });
                 }
 
-                // In "smart" and "drag" modes, releasing before hold_delay_ms cancels pending
-                // cleanly so normal middle-click (close tab, open link, paste) works naturally.
                 self.phase = ScrollPhase::Idle;
                 None
             }
             ScrollPhase::Active {
-                started_at,
-                delta_x,
-                delta_y,
-                toggle_latched,
+                button_held,
+                exited_deadzone_while_held,
                 ..
             } => {
-                if *toggle_latched {
-                    // Already latched earlier; ignore stray release
+                if !*button_held {
+                    // Already in Einrast-Modus; ignore stray release
                     return None;
                 }
+                *button_held = false;
 
                 match config.mode.as_str() {
                     "drag" => {
                         self.phase = ScrollPhase::Idle;
                         Some(IndicatorCommand::Hide)
                     }
-                    "toggle" => {
-                        *toggle_latched = true;
-                        None
-                    }
+                    "toggle" => None,
                     _ => {
-                        // "smart" hybrid mode:
-                        // Short hold after activation with minimal pointer displacement -> latch toggle
-                        // Long hold or dragged far -> stop immediately on release
-                        let active_dur = now.saturating_duration_since(*started_at);
-                        let dist = delta_x.hypot(*delta_y);
-                        if active_dur < Duration::from_millis(SMART_LATCH_MAX_ACTIVE_MS)
-                            && dist < SMART_LATCH_MAX_DIST_PX
-                        {
-                            *toggle_latched = true;
-                            None
-                        } else {
+                        // Windows Hybrid ("smart"):
+                        // Pulled outside deadzone while holding (Halte-Modus) -> stop on release
+                        // Released inside deadzone (Einrast-Modus) -> stay latched
+                        if *exited_deadzone_while_held {
                             self.phase = ScrollPhase::Idle;
                             Some(IndicatorCommand::Hide)
+                        } else {
+                            None
                         }
                     }
                 }
@@ -557,7 +631,7 @@ impl ScrollStateMachine {
         }
     }
 
-    /// Advances timers and emits smooth hi-res scroll wheel ticks.
+    /// Advances timers and emits smooth hi-res scroll wheel ticks using 2D vector physics.
     pub fn tick<E: WheelEmitter>(
         &mut self,
         now: Instant,
@@ -573,11 +647,14 @@ impl ScrollStateMachine {
             return commands;
         }
 
-        // Transition Pending -> Active once hold_delay_ms elapses without 3D-drag abort
+        // Optional legacy hold-delay transition when protect_3d_drag = true
         if let ScrollPhase::Pending {
             pressed_at,
             anchor_x,
             anchor_y,
+            overlay_x,
+            overlay_y,
+            live_cursor_available,
             move_x,
             move_y,
         } = self.phase
@@ -595,21 +672,24 @@ impl ScrollStateMachine {
                     last_tick_at: now,
                     anchor_x,
                     anchor_y,
-                    // Always start delta at (0, 0) upon activation — never leak pre-activation jitter
                     delta_x: 0.0,
                     delta_y: 0.0,
-                    toggle_latched: false,
+                    button_held: true,
+                    exited_deadzone_while_held: false,
+                    live_cursor_available,
+                    using_absolute_cursor: false,
                     accum_hires_x: 0.0,
                     accum_hires_y: 0.0,
                     pending_std_hires_x: 0,
                     pending_std_hires_y: 0,
                 };
                 commands.push(IndicatorCommand::Show {
-                    anchor_x,
-                    anchor_y,
+                    anchor_x: overlay_x,
+                    anchor_y: overlay_y,
                     deadzone: config.deadzone,
                     theme: config.theme.clone(),
                     opacity: config.indicator_opacity,
+                    allow_horizontal: config.allow_horizontal,
                 });
             }
             return commands;
@@ -641,51 +721,65 @@ impl ScrollStateMachine {
 
             let deadzone = config.deadzone as f32;
             let speed_mult = config.scroll_speed;
+            let curve_exp = config.scroll_curve_exponent;
 
-            // ---- Vertical Scrolling ----
-            let abs_dy = dy.abs();
-            if abs_dy > deadzone {
-                let mut rate_notches_per_sec = calc_scroll_rate(abs_dy - deadzone, speed_mult);
-                if config.invert_vertical {
-                    rate_notches_per_sec = -rate_notches_per_sec;
-                }
-                // Mouse DOWN (dy > 0) -> page scrolls DOWN -> REL_WHEEL < 0
-                // Mouse UP   (dy < 0) -> page scrolls UP   -> REL_WHEEL > 0
-                let signed_hires_rate = if dy < 0.0 {
-                    rate_notches_per_sec * (HI_RES_PER_NOTCH as f32)
-                } else {
-                    -rate_notches_per_sec * (HI_RES_PER_NOTCH as f32)
-                };
-
-                *accum_hires_y += signed_hires_rate * dt;
-                flush_axis_scroll(accum_hires_y, pending_std_hires_y, true, emitter);
-            } else {
-                *accum_hires_y = 0.0;
-            }
-
-            // ---- Horizontal Scrolling ----
             if config.allow_horizontal {
-                let abs_dx = dx.abs();
-                if abs_dx > deadzone {
-                    let mut rate_notches_per_sec = calc_scroll_rate(abs_dx - deadzone, speed_mult);
-                    if config.invert_horizontal {
-                        rate_notches_per_sec = -rate_notches_per_sec;
-                    }
-                    let signed_hires_rate = if dx > 0.0 {
-                        rate_notches_per_sec * (HI_RES_PER_NOTCH as f32)
-                    } else {
-                        -rate_notches_per_sec * (HI_RES_PER_NOTCH as f32)
-                    };
+                // True 2D circular deadzone + unit-vector directional decomposition
+                let dist = dx.hypot(dy);
+                if dist > deadzone {
+                    let total_rate = calc_scroll_rate(dist - deadzone, speed_mult, curve_exp);
+                    let ux = dx / dist;
+                    let uy = dy / dist;
 
-                    *accum_hires_x += signed_hires_rate * dt;
+                    let mut rate_y = total_rate * (-uy);
+                    if config.invert_vertical {
+                        rate_y = -rate_y;
+                    }
+                    *accum_hires_y += rate_y * (HI_RES_PER_NOTCH as f32) * dt;
+                    flush_axis_scroll(accum_hires_y, pending_std_hires_y, true, emitter);
+
+                    let mut rate_x = total_rate * ux;
+                    if config.invert_horizontal {
+                        rate_x = -rate_x;
+                    }
+                    *accum_hires_x += rate_x * (HI_RES_PER_NOTCH as f32) * dt;
                     flush_axis_scroll(accum_hires_x, pending_std_hires_x, false, emitter);
                 } else {
                     *accum_hires_x = 0.0;
+                    *accum_hires_y = 0.0;
+                }
+            } else {
+                // Vertical-only autoscroll
+                *accum_hires_x = 0.0;
+                let abs_dy = dy.abs();
+                if abs_dy > deadzone {
+                    let mut rate_y = calc_scroll_rate(abs_dy - deadzone, speed_mult, curve_exp);
+                    if config.invert_vertical {
+                        rate_y = -rate_y;
+                    }
+                    let signed_hires_rate = if dy < 0.0 {
+                        rate_y * (HI_RES_PER_NOTCH as f32)
+                    } else {
+                        -rate_y * (HI_RES_PER_NOTCH as f32)
+                    };
+                    *accum_hires_y += signed_hires_rate * dt;
+                    flush_axis_scroll(accum_hires_y, pending_std_hires_y, true, emitter);
+                } else {
+                    *accum_hires_y = 0.0;
                 }
             }
         }
 
         commands
+    }
+}
+
+fn is_outside_deadzone(dx: f32, dy: f32, config: &ConfigData) -> bool {
+    let dz = config.deadzone as f32;
+    if config.allow_horizontal {
+        dx.hypot(dy) > dz
+    } else {
+        dy.abs() > dz
     }
 }
 
@@ -727,13 +821,14 @@ fn flush_axis_scroll<E: WheelEmitter>(
 
 /// Calculates scroll rate (wheel notches per second) from distance beyond deadzone.
 ///
-/// Quadratic acceleration curve: gentle fine control near deadzone, rapid scan farther out.
-pub fn calc_scroll_rate(effective_dist: f32, speed_mult: f32) -> f32 {
+/// Progressive non-linear curve: gentle fine reading near deadzone, rapid scrolling farther away.
+pub fn calc_scroll_rate(effective_dist: f32, speed_mult: f32, curve_exponent: f32) -> f32 {
     if effective_dist <= 0.0 {
         return 0.0;
     }
-    let rate = speed_mult * (0.25 * effective_dist + 0.004 * effective_dist * effective_dist);
-    rate.min(80.0)
+    let exp = curve_exponent.clamp(1.0, 2.5) + 0.7;
+    let rate = speed_mult * (0.18 * effective_dist + 0.004 * effective_dist.powf(exp));
+    rate.min(100.0)
 }
 
 // ============================================================================
@@ -1007,10 +1102,34 @@ fn run_engine_loop(
         for action in actions {
             let cmd = match action {
                 RawEvdevAction::MiddleDown => {
-                    let cursor_pos = window_tracker.get_cursor_pos();
-                    state_machine.on_middle_down(event_now, &cfg, cursor_pos, || {
-                        window_tracker.check_excluded_context(&cfg)
-                    })
+                    if !state_machine.is_idle() {
+                        state_machine.on_middle_down(
+                            event_now,
+                            &cfg,
+                            (0, 0),
+                            (0, 0),
+                            false,
+                            || None,
+                        )
+                    } else {
+                        let probe = window_tracker.probe_pointer_and_start_live_cursor();
+                        if probe.is_dock_or_desktop
+                            || window_tracker.check_probe_excluded(&probe, &cfg).is_some()
+                        {
+                            window_tracker.stop_live_cursor();
+                            None
+                        } else {
+                            let live_ok = probe.from_kwin || !is_wayland_session();
+                            state_machine.on_middle_down(
+                                event_now,
+                                &cfg,
+                                (probe.cursor_x, probe.cursor_y),
+                                (probe.overlay_x, probe.overlay_y),
+                                live_ok,
+                                || None,
+                            )
+                        }
+                    }
                 }
                 RawEvdevAction::MiddleUp => state_machine.on_middle_up(event_now, &cfg),
                 RawEvdevAction::CancelInput => state_machine.on_cancel_input(),
@@ -1021,16 +1140,30 @@ fn run_engine_loop(
                 }
             };
             if let Some(c) = cmd {
+                if matches!(c, IndicatorCommand::Hide) {
+                    window_tracker.stop_live_cursor();
+                }
                 let _ = indicator_tx.send(c);
             }
         }
 
+        if state_machine.is_active()
+            && state_machine.uses_live_cursor()
+            && let Some((cx, cy)) = window_tracker.get_live_cursor_pos()
+        {
+            state_machine.set_absolute_cursor(cx, cy, &cfg);
+        }
+
         for cmd in state_machine.tick(Instant::now(), &cfg, emitter) {
+            if matches!(cmd, IndicatorCommand::Hide) {
+                window_tracker.stop_live_cursor();
+            }
             let _ = indicator_tx.send(cmd);
         }
     }
 
     if let Some(cmd) = state_machine.force_stop() {
+        window_tracker.stop_live_cursor();
         let _ = indicator_tx.send(cmd);
     }
     let _ = indicator_tx.send(IndicatorCommand::Shutdown);
@@ -1131,34 +1264,106 @@ mod tests {
     }
 
     #[test]
-    fn aborts_immediately_on_3d_orbit_drag_even_in_unlisted_app() {
+    fn windows_einrast_modus_activates_immediately_on_press_and_latches_on_release_inside_deadzone()
+    {
         let mut sm = ScrollStateMachine::new();
         let cfg = ConfigData::default();
         let mut emitter = MockEmitter::default();
         let t0 = Instant::now();
 
-        // Press BTN_MIDDLE on an unlisted website (Layer 2 allows it)
-        assert!(sm.on_middle_down(t0, &cfg, (500, 400), || None).is_none());
-        assert!(sm.is_pending());
+        // Press BTN_MIDDLE -> anchor appears immediately at click coordinates
+        let show = sm.on_middle_down(t0, &cfg, (2500, 600), (2500, 600), true, || None);
+        assert_eq!(
+            show,
+            Some(IndicatorCommand::Show {
+                anchor_x: 2500,
+                anchor_y: 600,
+                deadzone: 12,
+                theme: "dark".to_string(),
+                opacity: 0.92,
+                allow_horizontal: true,
+            })
+        );
+        assert!(sm.is_active());
 
-        // Immediately drag 12px (simulating 3D camera orbit in an unknown WebGL app)
-        sm.on_mouse_move(10.0, 7.0, &cfg);
+        // Small jitter inside deadzone while releasing after 80ms -> latches Einrast-Modus
+        sm.set_absolute_cursor(2503, 602, &cfg);
+        assert!(sm.on_middle_up(t0 + Duration::from_millis(80), &cfg).is_none());
+        assert!(sm.is_active());
 
-        // Layer 1 protection must have aborted Pending -> Idle immediately!
-        assert!(sm.is_idle());
+        // Move mouse down 60px -> scrolls smoothly downward
+        sm.set_absolute_cursor(2500, 660, &cfg);
+        for step in 1..=10 {
+            let _ = sm.tick(
+                t0 + Duration::from_millis(80 + step * 16),
+                &cfg,
+                &mut emitter,
+            );
+        }
+        assert!(!emitter.events.is_empty());
+        assert!(emitter.events.iter().all(|(v, h, _)| *v && *h < 0));
 
-        // Even after 500ms while holding BTN_MIDDLE, autoscroll MUST NOT activate
-        let cmds = sm.tick(t0 + Duration::from_millis(500), &cfg, &mut emitter);
-        assert!(cmds.is_empty());
-        assert!(sm.is_idle());
+        // Return pointer onto anchor deadzone -> zero drift, scrolling stops completely
+        emitter.events.clear();
+        sm.set_absolute_cursor(2501, 601, &cfg);
+        let _ = sm.tick(t0 + Duration::from_millis(260), &cfg, &mut emitter);
         assert!(emitter.events.is_empty());
 
-        // Releasing BTN_MIDDLE stays Idle cleanly
-        assert!(
-            sm.on_middle_up(t0 + Duration::from_millis(600), &cfg)
-                .is_none()
-        );
+        // Any mouse click (e.g. left click / CancelInput) or ESC stops Einrast-Modus
+        assert_eq!(sm.on_cancel_input(), Some(IndicatorCommand::Hide));
         assert!(sm.is_idle());
+    }
+
+    #[test]
+    fn windows_halte_modus_scrolls_while_held_outside_deadzone_and_stops_on_release() {
+        let mut sm = ScrollStateMachine::new();
+        let cfg = ConfigData::default();
+        let mut emitter = MockEmitter::default();
+        let t0 = Instant::now();
+
+        let show = sm.on_middle_down(t0, &cfg, (1000, 500), (1000, 500), true, || None);
+        assert!(matches!(show, Some(IndicatorCommand::Show { .. })));
+
+        // Pull mouse directly out of deadzone while still holding BTN_MIDDLE
+        sm.set_absolute_cursor(1000, 570, &cfg);
+        for step in 1..=6 {
+            let _ = sm.tick(t0 + Duration::from_millis(step * 16), &cfg, &mut emitter);
+        }
+        assert!(!emitter.events.is_empty());
+        assert!(emitter.events.iter().all(|(v, h, _)| *v && *h < 0));
+
+        // Release BTN_MIDDLE -> anchor disappears immediately (Halte-Modus)
+        let stop = sm.on_middle_up(t0 + Duration::from_millis(120), &cfg);
+        assert_eq!(stop, Some(IndicatorCommand::Hide));
+        assert!(sm.is_idle());
+    }
+
+    #[test]
+    fn diagonal_2d_scrolling_respects_circular_deadzone_and_1d_blocks_horizontal() {
+        let mut sm = ScrollStateMachine::new();
+        let mut cfg = ConfigData::default();
+        cfg.deadzone = 12;
+        cfg.allow_horizontal = true;
+        let mut emitter = MockEmitter::default();
+        let t0 = Instant::now();
+
+        let _ = sm.on_middle_down(t0, &cfg, (500, 500), (500, 500), true, || None);
+        // (9, 9) has hypot ~12.73 > 12 (outside circular deadzone), emits both axes
+        sm.set_absolute_cursor(550, 550, &cfg);
+        for step in 1..=10 {
+            let _ = sm.tick(t0 + Duration::from_millis(step * 16), &cfg, &mut emitter);
+        }
+        assert!(emitter.events.iter().any(|(v, h, _)| *v && *h < 0));
+        assert!(emitter.events.iter().any(|(v, h, _)| !*v && *h > 0));
+
+        // Now disable horizontal scrolling: moving sideways only must NOT scroll
+        emitter.events.clear();
+        cfg.allow_horizontal = false;
+        sm.set_absolute_cursor(600, 500, &cfg);
+        for step in 11..=15 {
+            let _ = sm.tick(t0 + Duration::from_millis(step * 16), &cfg, &mut emitter);
+        }
+        assert!(emitter.events.is_empty());
     }
 
     #[test]
@@ -1168,91 +1373,55 @@ mod tests {
         let mut emitter = MockEmitter::default();
         let t0 = Instant::now();
 
-        // Layer 2 detects Onshape / Bambu Studio -> never even enters Pending!
         assert!(
-            sm.on_middle_down(t0, &cfg, (500, 400), || Some("onshape".to_string()))
-                .is_none()
+            sm.on_middle_down(
+                t0,
+                &cfg,
+                (500, 400),
+                (500, 400),
+                true,
+                || Some("onshape".to_string())
+            )
+            .is_none()
         );
         assert!(sm.is_idle());
 
-        // Even if user pauses stationary for 400ms and then moves, autoscroll stays disabled
         let cmds = sm.tick(t0 + Duration::from_millis(400), &cfg, &mut emitter);
         assert!(cmds.is_empty());
-        sm.on_mouse_move(0.0, 50.0, &cfg);
-        let cmds2 = sm.tick(t0 + Duration::from_millis(416), &cfg, &mut emitter);
-        assert!(cmds2.is_empty());
         assert!(emitter.events.is_empty());
     }
 
     #[test]
-    fn quick_middle_click_in_smart_mode_does_not_activate_autoscroll() {
+    fn optional_protect_3d_drag_aborts_immediate_movement_when_enabled() {
         let mut sm = ScrollStateMachine::new();
-        let cfg = ConfigData::default();
-        let t0 = Instant::now();
-
-        sm.on_middle_down(t0, &cfg, (300, 300), || None);
-        assert!(sm.is_pending());
-
-        // Release after 90ms (closing a browser tab)
-        let res = sm.on_middle_up(t0 + Duration::from_millis(90), &cfg);
-        assert!(res.is_none());
-        assert!(sm.is_idle());
-    }
-
-    #[test]
-    fn stationary_hold_activates_and_emits_smooth_hires_scroll() {
-        let mut sm = ScrollStateMachine::new();
-        let cfg = ConfigData::default();
+        let mut cfg = ConfigData::default();
+        cfg.protect_3d_drag = true;
         let mut emitter = MockEmitter::default();
         let t0 = Instant::now();
 
-        sm.on_middle_down(t0, &cfg, (600, 500), || None);
-        // Tiny sub-threshold jitter (2px < 5px) must NOT abort
-        sm.on_mouse_move(1.5, -1.0, &cfg);
+        assert!(
+            sm.on_middle_down(t0, &cfg, (500, 400), (500, 400), false, || None)
+                .is_none()
+        );
         assert!(sm.is_pending());
 
-        // Hold stationary past hold_delay_ms (180ms)
-        let cmds = sm.tick(t0 + Duration::from_millis(190), &cfg, &mut emitter);
-        assert!(sm.is_active());
-        assert_eq!(
-            cmds,
-            vec![IndicatorCommand::Show {
-                anchor_x: 600,
-                anchor_y: 500,
-                deadzone: 12,
-                theme: "dark".to_string(),
-                opacity: 0.92,
-            }]
-        );
-
-        // Move pointer 60px downward beyond deadzone (total dy = 60, effective = 48)
-        sm.on_mouse_move(0.0, 60.0, &cfg);
-        for step in 1..=10 {
-            let t = t0 + Duration::from_millis(190 + step * 16);
-            let _ = sm.tick(t, &cfg, &mut emitter);
-        }
-
-        // Expect downward (negative) hi-res scroll events emitted smoothly
-        assert!(!emitter.events.is_empty());
-        assert!(emitter.events.iter().all(|(vert, hires, _)| *vert && *hires < 0));
-
-        // Release after dragging (> 350ms or > 20px) stops autoscroll
-        let stop_cmd = sm.on_middle_up(t0 + Duration::from_millis(400), &cfg);
-        assert_eq!(stop_cmd, Some(IndicatorCommand::Hide));
+        sm.on_mouse_move(10.0, 7.0, &cfg);
         assert!(sm.is_idle());
+
+        let cmds = sm.tick(t0 + Duration::from_millis(500), &cfg, &mut emitter);
+        assert!(cmds.is_empty());
+        assert!(emitter.events.is_empty());
     }
 
     #[test]
-    fn toggle_mode_latches_on_quick_click_and_cancels_on_esc_or_wheel() {
+    fn physical_wheel_and_second_middle_click_stop_active_autoscroll() {
         let mut sm = ScrollStateMachine::new();
-        let mut cfg = ConfigData::default();
-        cfg.mode = "toggle".to_string();
-        let emitter = MockEmitter::default();
+        let cfg = ConfigData::default();
         let t0 = Instant::now();
 
-        sm.on_middle_down(t0, &cfg, (400, 400), || None);
-        let show_cmd = sm.on_middle_up(t0 + Duration::from_millis(80), &cfg);
-        assert!(matches!(show_cmd, Some(IndicatorCommand::Show { .. })));
+        let show = sm.on_middle_down(t0, &cfg, (400, 400), (400, 400), true, || None);
+        assert!(matches!(show, Some(IndicatorCommand::Show { .. })));
+        assert!(sm.on_middle_up(t0 + Duration::from_millis(70), &cfg).is_none());
         assert!(sm.is_active());
 
         // Spinning physical wheel within grace window (< 150ms) is ignored
@@ -1264,24 +1433,39 @@ mod tests {
         assert_eq!(hide_cmd, Some(IndicatorCommand::Hide));
         assert!(sm.is_idle());
 
-        // Reactivate and verify ESC / button click cancels
-        sm.on_middle_down(t0 + Duration::from_millis(400), &cfg, (400, 400), || None);
+        // Reactivate and verify second middle click stops Einrast-Modus
+        let _ = sm.on_middle_down(
+            t0 + Duration::from_millis(400),
+            &cfg,
+            (400, 400),
+            (400, 400),
+            true,
+            || None,
+        );
         let _ = sm.on_middle_up(t0 + Duration::from_millis(460), &cfg);
         assert!(sm.is_active());
-        assert_eq!(sm.on_cancel_input(), Some(IndicatorCommand::Hide));
+        assert_eq!(
+            sm.on_middle_down(
+                t0 + Duration::from_millis(600),
+                &cfg,
+                (400, 400),
+                (400, 400),
+                true,
+                || None,
+            ),
+            Some(IndicatorCommand::Hide)
+        );
         assert!(sm.is_idle());
-
-        let _ = emitter.events;
     }
 
     #[test]
-    fn scroll_rate_curve_scales_smoothly() {
-        assert_eq!(calc_scroll_rate(0.0, 1.0), 0.0);
-        let slow = calc_scroll_rate(5.0, 1.0);
-        let med = calc_scroll_rate(30.0, 1.0);
-        let fast = calc_scroll_rate(100.0, 1.0);
-        assert!(slow > 1.0 && slow < 2.0);
-        assert!(med > 10.0 && med < 12.0);
-        assert!(fast > 60.0 && fast <= 80.0);
+    fn scroll_rate_curve_scales_progressively() {
+        assert_eq!(calc_scroll_rate(0.0, 1.0, 1.3), 0.0);
+        let slow = calc_scroll_rate(5.0, 1.0, 1.3);
+        let med = calc_scroll_rate(30.0, 1.0, 1.3);
+        let fast = calc_scroll_rate(120.0, 1.0, 1.3);
+        assert!(slow > 0.5 && slow < 1.5);
+        assert!(med > slow * 5.0);
+        assert!(fast > 50.0 && fast <= 100.0);
     }
 }
