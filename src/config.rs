@@ -159,7 +159,16 @@ pub struct ConfigData {
     #[serde(default = "default_drag_cancel_threshold_px")]
     pub drag_cancel_threshold_px: f32,
 
-    /// Stationary hold duration in milliseconds before autoscroll activates.
+    /// System-wide short-click protection: quick stationary middle-clicks (< `hold_delay_ms`
+    /// without dragging out of the deadzone) pass through untouched to every application
+    /// (closing tabs in Firefox/Obsidian/VS Code/Nautilus/Dolphin, opening links & folders,
+    /// primary-selection paste). Pulling outside the deadzone still starts Halte-Modus immediately;
+    /// holding stationary >= `hold_delay_ms` activates Einrast-Modus.
+    #[serde(default = "default_true")]
+    pub short_click_passthrough: bool,
+
+    /// Stationary hold duration in milliseconds before Einrast-Modus activates when
+    /// `short_click_passthrough` (or `protect_3d_drag`) is enabled.
     #[serde(default = "default_hold_delay_ms")]
     pub hold_delay_ms: u64,
 
@@ -201,6 +210,7 @@ impl Default for ConfigData {
             tick_interval_ms: default_tick_interval_ms(),
             protect_3d_drag: default_false(),
             drag_cancel_threshold_px: default_drag_cancel_threshold_px(),
+            short_click_passthrough: default_true(),
             hold_delay_ms: default_hold_delay_ms(),
             ignore_hyperlinks_and_tabs: default_true(),
             browser_top_chrome_px: default_browser_top_chrome_px(),
@@ -445,6 +455,7 @@ mod tests {
         assert!(cfg.allow_horizontal);
         assert_eq!(cfg.theme, "dark");
         assert!(!cfg.protect_3d_drag);
+        assert!(cfg.short_click_passthrough);
         assert!(cfg.ignore_hyperlinks_and_tabs);
         assert_eq!(cfg.browser_top_chrome_px, 95);
         assert!(cfg.auto_exclude_3d_apps);
@@ -488,6 +499,7 @@ mod tests {
         assert!(!cfg.allow_horizontal);
         assert!(!cfg.autostart);
         assert!(!cfg.protect_3d_drag);
+        assert!(cfg.short_click_passthrough);
         assert!(cfg.ignore_hyperlinks_and_tabs);
         assert_eq!(cfg.browser_top_chrome_px, 95);
         assert!(cfg.auto_exclude_3d_apps);
@@ -517,6 +529,7 @@ mod tests {
         let cfg = mgr.snapshot();
         assert_eq!(cfg.config_version, CURRENT_CONFIG_VERSION);
         assert!(!cfg.protect_3d_drag);
+        assert!(cfg.short_click_passthrough);
         assert!(cfg.ignore_hyperlinks_and_tabs);
         assert_eq!(cfg.browser_top_chrome_px, 95);
         assert!(cfg.auto_exclude_3d_apps);

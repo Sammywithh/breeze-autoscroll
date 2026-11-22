@@ -311,11 +311,49 @@ impl eframe::App for SettingsApp {
                             ui.add_space(2.0);
                             changed |= ui
                                 .checkbox(
-                                    &mut self.draft.ignore_hyperlinks_and_tabs,
-                                    "Interaktive Elemente ignorieren (Tabs, Hyperlinks & Dolphin-Ordner)",
+                                    &mut self.draft.short_click_passthrough,
+                                    "Kurze Mittelklicks systemweit durchreichen (Tabs, Links, Ordner in allen Apps)",
                                 )
                                 .on_hover_text(
-                                    "Aktiviert Autoscroll nur auf freien, nicht-interaktiven Flächen: Mittelklick auf Browser-Tabs, Hyperlinks (Hand-Cursor) sowie Ordner, Dateien, Tabs und Seitenleisten in Dolphin/KDE-Apps führt ausschließlich die App-Aktion aus.",
+                                    "Systemweiter Schutz für alle Programme (Firefox, Obsidian, Nautilus, Dolphin, VS Code usw.): Kurzes Antippen ohne Ziehen bleibt ein normaler Mittelklick. Direktes Ziehen startet sofort den Halte-Modus; kurzes Halten rastet den Anker ein.",
+                                )
+                                .changed();
+
+                            if self.draft.short_click_passthrough {
+                                ui.horizontal(|ui| {
+                                    ui.add_space(22.0);
+                                    ui.label(
+                                        RichText::new("Haltezeit für Einrast-Modus:")
+                                            .size(12.0)
+                                            .color(palette.text_secondary),
+                                    );
+                                    let mut delay_ms = self.draft.hold_delay_ms as i32;
+                                    if ui
+                                        .add(
+                                            Slider::new(&mut delay_ms, 100..=400)
+                                                .show_value(false),
+                                        )
+                                        .changed()
+                                    {
+                                        self.draft.hold_delay_ms = delay_ms as u64;
+                                        changed = true;
+                                    }
+                                    ui.label(
+                                        RichText::new(format!("{} ms", self.draft.hold_delay_ms))
+                                            .strong()
+                                            .color(palette.accent),
+                                    );
+                                });
+                            }
+
+                            ui.add_space(2.0);
+                            changed |= ui
+                                .checkbox(
+                                    &mut self.draft.ignore_hyperlinks_and_tabs,
+                                    "Zusätzliche Erkennung interaktiver Elemente (Cursor, Fensterleisten & AT-SPI2)",
+                                )
+                                .on_hover_text(
+                                    "Unterdrückt Autoscroll zusätzlich auch bei längerem Gedrückthalten über Hand-Cursor-Links, Titelleisten/Tableisten und AT-SPI2-UI-Elementen.",
                                 )
                                 .changed();
                         });
