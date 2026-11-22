@@ -307,6 +307,17 @@ impl eframe::App for SettingsApp {
                                     "Aktiv: 4-Wege-Anker (Hoch/Runter/Links/Rechts + Diagonal). Deaktiviert: 2-Wege-Anker (nur Vertikal).",
                                 )
                                 .changed();
+
+                            ui.add_space(2.0);
+                            changed |= ui
+                                .checkbox(
+                                    &mut self.draft.ignore_hyperlinks_and_tabs,
+                                    "Interaktive Elemente ignorieren (Browser-Tabs schließen & Hyperlinks öffnen)",
+                                )
+                                .on_hover_text(
+                                    "Aktiviert Autoscroll nur auf nicht-interaktiven Flächen: Mittelklick auf Browser-Tabs, Symbolleisten oder Hyperlinks (Hand-Cursor) führt ausschließlich die Browser-Aktion aus.",
+                                )
+                                .changed();
                         });
 
                         ui.add_space(10.0);

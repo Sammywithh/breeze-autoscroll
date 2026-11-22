@@ -92,6 +92,9 @@ fn default_drag_cancel_threshold_px() -> f32 {
 fn default_hold_delay_ms() -> u64 {
     180
 }
+fn default_browser_top_chrome_px() -> u32 {
+    95
+}
 
 /// Persistent user configuration stored in `~/.config/breeze-autoscroll/config.json`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -160,6 +163,16 @@ pub struct ConfigData {
     #[serde(default = "default_hold_delay_ms")]
     pub hold_delay_ms: u64,
 
+    /// Do not activate autoscroll when middle-clicking interactive elements
+    /// (browser tabs, address/bookmarks bar, window titlebars, or hyperlinks).
+    #[serde(default = "default_true")]
+    pub ignore_hyperlinks_and_tabs: bool,
+
+    /// Height in pixels of the top browser chrome (tab bar + navigation/address bar)
+    /// where middle-click closes tabs or interacts with toolbar controls.
+    #[serde(default = "default_browser_top_chrome_px")]
+    pub browser_top_chrome_px: u32,
+
     /// Automatically disable autoscroll when a recognized 3D/CAD app or browser tab is active.
     #[serde(default = "default_true")]
     pub auto_exclude_3d_apps: bool,
@@ -189,6 +202,8 @@ impl Default for ConfigData {
             protect_3d_drag: default_false(),
             drag_cancel_threshold_px: default_drag_cancel_threshold_px(),
             hold_delay_ms: default_hold_delay_ms(),
+            ignore_hyperlinks_and_tabs: default_true(),
+            browser_top_chrome_px: default_browser_top_chrome_px(),
             auto_exclude_3d_apps: default_true(),
             excluded_apps_and_titles: default_excluded_apps_and_titles(),
         }
@@ -214,6 +229,7 @@ impl ConfigData {
         self.tick_interval_ms = self.tick_interval_ms.clamp(8, 50);
         self.drag_cancel_threshold_px = self.drag_cancel_threshold_px.clamp(2.0, 25.0);
         self.hold_delay_ms = self.hold_delay_ms.clamp(80, 600);
+        self.browser_top_chrome_px = self.browser_top_chrome_px.clamp(40, 180);
         self.excluded_apps_and_titles = self
             .excluded_apps_and_titles
             .iter()
@@ -429,6 +445,8 @@ mod tests {
         assert!(cfg.allow_horizontal);
         assert_eq!(cfg.theme, "dark");
         assert!(!cfg.protect_3d_drag);
+        assert!(cfg.ignore_hyperlinks_and_tabs);
+        assert_eq!(cfg.browser_top_chrome_px, 95);
         assert!(cfg.auto_exclude_3d_apps);
         assert!(cfg.excluded_apps_and_titles.iter().any(|s| s == "onshape"));
         assert!(
@@ -470,6 +488,8 @@ mod tests {
         assert!(!cfg.allow_horizontal);
         assert!(!cfg.autostart);
         assert!(!cfg.protect_3d_drag);
+        assert!(cfg.ignore_hyperlinks_and_tabs);
+        assert_eq!(cfg.browser_top_chrome_px, 95);
         assert!(cfg.auto_exclude_3d_apps);
         assert!((cfg.drag_cancel_threshold_px - 5.0).abs() < 1e-5);
         assert_eq!(cfg.hold_delay_ms, 180);
@@ -497,6 +517,8 @@ mod tests {
         let cfg = mgr.snapshot();
         assert_eq!(cfg.config_version, CURRENT_CONFIG_VERSION);
         assert!(!cfg.protect_3d_drag);
+        assert!(cfg.ignore_hyperlinks_and_tabs);
+        assert_eq!(cfg.browser_top_chrome_px, 95);
         assert!(cfg.auto_exclude_3d_apps);
         assert!((cfg.scroll_speed - 0.5).abs() < 1e-5);
         assert!(!cfg.allow_horizontal);
