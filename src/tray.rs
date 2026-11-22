@@ -279,6 +279,7 @@ impl AutoscrollControlIface {
         let wh = win_parts.next().and_then(|s| s.trim().parse::<i32>().ok()).unwrap_or(0);
         let fullscreen = win_parts.next().is_some_and(|s| s.trim() == "1");
         let borderless = win_parts.next().is_some_and(|s| s.trim() == "1");
+        let w_pid = win_parts.next().and_then(|s| s.trim().parse::<u32>().ok()).unwrap_or(0);
 
         let mut scr_parts = screen_geom.split(',');
         let sx = scr_parts.next().and_then(|s| s.trim().parse::<i32>().ok()).unwrap_or(0);
@@ -299,6 +300,7 @@ impl AutoscrollControlIface {
             wy,
             ww,
             wh,
+            w_pid,
             fullscreen,
             borderless,
             sx,
@@ -342,7 +344,7 @@ impl AutoscrollControlIface {
             .map(|w| format!("class='{}' title='{}'", w.app_class, w.title))
             .unwrap_or_else(|| "none".to_string());
         format!(
-            "from_kwin={} cursor=({}, {}) overlay=({}, {}) win=({}, {}, {}x{}) hotspot=({:?}, {:?}) interactive_cursor={} interactive_chrome={} dock_or_desktop={} {}",
+            "from_kwin={} cursor=({}, {}) overlay=({}, {}) win=({}, {}, {}x{}) pid={} hotspot=({:?}, {:?}) interactive_cursor={} interactive_chrome={} atspi_role={:?} interactive_atspi={} dock_or_desktop={} {}",
             probe.from_kwin,
             probe.cursor_x,
             probe.cursor_y,
@@ -352,10 +354,13 @@ impl AutoscrollControlIface {
             probe.win_y,
             probe.win_w,
             probe.win_h,
+            probe.win_pid,
             probe.hotspot_x,
             probe.hotspot_y,
             probe.is_interactive_cursor,
             interactive_chrome,
+            probe.atspi_role,
+            probe.is_interactive_atspi,
             probe.is_dock_or_desktop,
             win_desc
         )

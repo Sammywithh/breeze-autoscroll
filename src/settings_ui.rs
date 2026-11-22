@@ -312,10 +312,10 @@ impl eframe::App for SettingsApp {
                             changed |= ui
                                 .checkbox(
                                     &mut self.draft.ignore_hyperlinks_and_tabs,
-                                    "Interaktive Elemente ignorieren (Browser-Tabs schließen & Hyperlinks öffnen)",
+                                    "Interaktive Elemente ignorieren (Tabs, Hyperlinks & Dolphin-Ordner)",
                                 )
                                 .on_hover_text(
-                                    "Aktiviert Autoscroll nur auf nicht-interaktiven Flächen: Mittelklick auf Browser-Tabs, Symbolleisten oder Hyperlinks (Hand-Cursor) führt ausschließlich die Browser-Aktion aus.",
+                                    "Aktiviert Autoscroll nur auf freien, nicht-interaktiven Flächen: Mittelklick auf Browser-Tabs, Hyperlinks (Hand-Cursor) sowie Ordner, Dateien, Tabs und Seitenleisten in Dolphin/KDE-Apps führt ausschließlich die App-Aktion aus.",
                                 )
                                 .changed();
                         });

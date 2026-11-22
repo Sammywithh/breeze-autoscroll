@@ -19,6 +19,7 @@ use x11rb::protocol::xproto::{AtomEnum, ConnectionExt as _, Window};
 use x11rb::rust_connection::RustConnection;
 use zbus::{Connection, Proxy};
 
+use crate::atspi_inspector::AtSpiInspector;
 use crate::config::ConfigData;
 
 const KWIN_TRACKER_SCRIPT_NAME: &str = "breeze_autoscroll_tracker";
@@ -26,6 +27,9 @@ const KWIN_CURSOR_LIVE_SCRIPT_NAME: &str = "breeze_autoscroll_cursor_live";
 const PROBE_TIMEOUT_MS: u64 = 80;
 /// Client-side headerbar height for frameless non-browser CSD applications (GTK4/Libadwaita/Electron).
 const CSD_HEADERBAR_HEIGHT_PX: i32 = 38;
+/// Fallback top toolbar + tab bar height for tabbed file managers (Dolphin, Nautilus, etc.)
+/// if AT-SPI2 hit-testing is unavailable.
+const FILE_MANAGER_TOP_CHROME_PX: i32 = 86;
 
 /// Metadata about an application window (including active browser tab title).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -61,6 +65,8 @@ pub struct PointerProbeResult {
     pub win_w: i32,
     /// Client area height of the window under the cursor.
     pub win_h: i32,
+    /// PID of the window directly under the cursor (for AT-SPI2 hit-testing).
+    pub win_pid: u32,
     /// True when the target window is in fullscreen mode.
     pub is_fullscreen: bool,
     /// True when the target window uses client-side decorations (`noBorder == true`).
@@ -71,6 +77,10 @@ pub struct PointerProbeResult {
     pub hotspot_y: Option<i32>,
     /// True when the cursor shape is a hyperlink/button pointer (`pointing_hand` / `pointer` / `hand2`).
     pub is_interactive_cursor: bool,
+    /// Deepest AT-SPI2 role name under the pointer (e.g. `"list item"`, `"page tab"`, `"list"`).
+    pub atspi_role: Option<String>,
+    /// True when AT-SPI2 identified an interactive element (folder/file icon, tab, sidebar item, button).
+    pub is_interactive_atspi: bool,
     /// True when coordinates came directly from KWin's live compositor state.
     pub from_kwin: bool,
 }
@@ -422,6 +432,7 @@ pub struct WindowTracker {
     sync: Arc<(Mutex<TrackerState>, Condvar)>,
     x11: Arc<Mutex<Option<X11Client>>>,
     drm: Arc<Mutex<Option<DrmCursorInspector>>>,
+    atspi: AtSpiInspector,
     bridge: Arc<Mutex<Option<BridgeHandle>>>,
 }
 
@@ -437,12 +448,15 @@ impl WindowTracker {
             sync: Arc::new((Mutex::new(TrackerState::default()), Condvar::new())),
             x11: Arc::new(Mutex::new(None)),
             drm: Arc::new(Mutex::new(None)),
+            atspi: AtSpiInspector::new(),
             bridge: Arc::new(Mutex::new(None)),
         }
     }
 
-    /// Starts the persistent KWin D-Bus scripting bridge and installs the background window tracker.
+    /// Starts the persistent KWin D-Bus scripting bridge and AT-SPI2 inspector.
     pub fn start_kwin_bridge(&self) {
+        self.atspi.start();
+
         let Ok(mut guard) = self.bridge.lock() else {
             return;
         };
@@ -460,8 +474,10 @@ impl WindowTracker {
         *guard = Some(BridgeHandle { tx, join });
     }
 
-    /// Unloads ephemeral KWin scripts and shuts down the KWin bridge thread.
+    /// Unloads ephemeral KWin scripts and shuts down the KWin bridge & AT-SPI2 worker threads.
     pub fn stop_kwin_bridge(&self) {
+        self.atspi.stop();
+
         let handle = if let Ok(mut guard) = self.bridge.lock() {
             guard.take()
         } else {
@@ -517,6 +533,7 @@ impl WindowTracker {
         win_y: i32,
         win_w: i32,
         win_h: i32,
+        win_pid: u32,
         is_fullscreen: bool,
         no_border: bool,
         screen_x: i32,
@@ -565,6 +582,35 @@ impl WindowTracker {
             })
         };
 
+        // For native desktop apps (Dolphin, Konsole, Kate, Okular, GTK apps, etc.),
+        // inspect the exact widget/item under the pointer via AT-SPI2.
+        let is_browser = window.as_ref().is_some_and(is_browser_window);
+        let in_client_rect = win_w > 0
+            && win_h > 0
+            && cursor_x >= win_x
+            && cursor_x < win_x + win_w
+            && cursor_y >= win_y
+            && cursor_y < win_y + win_h;
+
+        let (atspi_role, is_interactive_atspi) = if !is_dock_or_desktop
+            && !is_interactive_cursor
+            && !is_browser
+            && win_pid > 0
+            && in_client_rect
+        {
+            let rel_x = cursor_x - win_x;
+            let rel_y = cursor_y - win_y;
+            let title_ref = window.as_ref().map(|w| w.title.as_str()).unwrap_or("");
+            match self.atspi.inspect_point(
+                win_pid, title_ref, rel_x, rel_y, cursor_x, cursor_y, win_w, win_h,
+            ) {
+                Some(hit) => (Some(hit.role), hit.is_interactive),
+                None => (None, false),
+            }
+        } else {
+            (None, false)
+        };
+
         let result = PointerProbeResult {
             cursor_x,
             cursor_y,
@@ -576,11 +622,14 @@ impl WindowTracker {
             win_y,
             win_w,
             win_h,
+            win_pid,
             is_fullscreen,
             no_border,
             hotspot_x,
             hotspot_y,
             is_interactive_cursor,
+            atspi_role,
+            is_interactive_atspi,
             from_kwin: true,
         };
 
@@ -817,7 +866,8 @@ impl WindowTracker {
     }
 
     /// Checks whether a probe result falls on interactive window chrome (server-side titlebar,
-    /// browser tab bar / address bar, or CSD headerbar) or over a hyperlink/button pointer cursor.
+    /// browser tab bar / address bar, or CSD headerbar), over a hyperlink/button pointer cursor,
+    /// or over an interactive AT-SPI2 UI control/item (Dolphin folders/files, tabs, sidebar items).
     pub fn is_interactive_probe(
         &self,
         probe: &PointerProbeResult,
@@ -826,7 +876,9 @@ impl WindowTracker {
         if !config.ignore_hyperlinks_and_tabs {
             return false;
         }
-        is_interactive_window_chrome(probe, config) || probe.is_interactive_cursor
+        is_interactive_window_chrome(probe, config)
+            || probe.is_interactive_cursor
+            || probe.is_interactive_atspi
     }
 
     /// Checks whether a probe result (preferring the window directly under the cursor)
@@ -962,8 +1014,31 @@ pub fn is_browser_window(info: &ActiveWindowInfo) -> bool {
         .any(|token| fields.iter().any(|f| f.contains(token)))
 }
 
+/// Returns true when the window metadata identifies a tabbed file manager (Dolphin, Nautilus,
+/// Thunar, Nemo, PCManFM, Caja, Krusader) where the top area contains the location bar & tab strip.
+pub fn is_file_manager_window(info: &ActiveWindowInfo) -> bool {
+    const FM_TOKENS: &[&str] = &[
+        "dolphin",
+        "nautilus",
+        "org.gnome.files",
+        "nemo",
+        "thunar",
+        "pcmanfm",
+        "caja",
+        "krusader",
+    ];
+    let fields = [
+        info.app_class.to_ascii_lowercase(),
+        info.app_name.to_ascii_lowercase(),
+        info.desktop_file.to_ascii_lowercase(),
+    ];
+    FM_TOKENS
+        .iter()
+        .any(|token| fields.iter().any(|f| f.contains(token)))
+}
+
 /// Returns true when `probe` was clicked on a window titlebar, frame decoration,
-/// browser tab bar / address bar, or CSD headerbar.
+/// browser tab bar / address bar, tabbed file manager toolbar/tab bar fallback, or CSD headerbar.
 pub fn is_interactive_window_chrome(
     probe: &PointerProbeResult,
     config: &ConfigData,
@@ -996,8 +1071,15 @@ pub fn is_interactive_window_chrome(
         if rel_y >= 0 && rel_y < top_chrome {
             return true;
         }
+    } else if probe.atspi_role.is_none()
+        && probe.window.as_ref().is_some_and(is_file_manager_window)
+        && rel_y >= 0
+        && rel_y < FILE_MANAGER_TOP_CHROME_PX
+    {
+        // 3. Fallback toolbar + tab bar guard for file managers when AT-SPI2 is unavailable
+        return true;
     } else if probe.no_border && rel_y >= 0 && rel_y < CSD_HEADERBAR_HEIGHT_PX {
-        // 3. Frameless CSD application window headerbar
+        // 4. Frameless CSD application window headerbar
         return true;
     }
 
@@ -1397,6 +1479,7 @@ const KWIN_CURSOR_LIVE_JS: &str = r#"
         var wy = 0;
         var ww = 0;
         var wh = 0;
+        var wPid = 0;
         var isFullScreen = "0";
         var noBorder = "0";
 
@@ -1442,6 +1525,9 @@ const KWIN_CURSOR_LIVE_JS: &str = r#"
             if (win.noBorder) {
                 noBorder = "1";
             }
+            if (win.pid && win.pid > 0) {
+                wPid = Math.round(win.pid);
+            }
             if (win.captionChanged) {
                 win.captionChanged.connect(notifyContextChanged);
             }
@@ -1478,7 +1564,7 @@ const KWIN_CURSOR_LIVE_JS: &str = r#"
         lastSentMs = Date.now();
 
         var coords = String(cx) + "," + String(cy) + "," + String(vw) + "," + String(vh);
-        var winGeom = String(wx) + "," + String(wy) + "," + String(ww) + "," + String(wh) + "," + isFullScreen + "," + noBorder;
+        var winGeom = String(wx) + "," + String(wy) + "," + String(ww) + "," + String(wh) + "," + isFullScreen + "," + noBorder + "," + String(wPid);
         var screenGeom = String(sx) + "," + String(sy) + "," + sScale;
 
         callDBus(
@@ -1815,5 +1901,77 @@ mod tests {
         tracker.notify_window_context_changed();
         assert!(tracker.take_window_context_changed());
         assert!(!tracker.take_window_context_changed());
+    }
+
+    #[test]
+    fn detects_dolphin_folder_tab_places_via_atspi_and_allows_empty_space() {
+        let tracker = WindowTracker::new();
+        let cfg = ConfigData::default();
+
+        let dolphin_win = ActiveWindowInfo {
+            app_class: "org.kde.dolphin".to_string(),
+            app_name: "dolphin".to_string(),
+            desktop_file: "org.kde.dolphin".to_string(),
+            title: "Antigravity-x64 — Dolphin".to_string(),
+            updated_at_ms: 0,
+        };
+        assert!(is_file_manager_window(&dolphin_win));
+
+        // 1. Middle-clicking a folder icon (`resources`) in Dolphin -> AT-SPI2 reports `list item`
+        let folder_probe = PointerProbeResult {
+            cursor_x: 2320,
+            cursor_y: 250,
+            overlay_x: 2320,
+            overlay_y: 250,
+            window: Some(dolphin_win.clone()),
+            win_x: 1920,
+            win_y: 120,
+            win_w: 1227,
+            win_h: 632,
+            win_pid: 39175,
+            atspi_role: Some("list item".to_string()),
+            is_interactive_atspi: true,
+            from_kwin: true,
+            ..Default::default()
+        };
+        assert!(tracker.is_interactive_probe(&folder_probe, &cfg));
+
+        // 2. Middle-clicking empty space in Dolphin file view -> AT-SPI2 reports `list` (no item)
+        let empty_space_probe = PointerProbeResult {
+            cursor_x: 2820,
+            cursor_y: 620,
+            overlay_x: 2820,
+            overlay_y: 620,
+            window: Some(dolphin_win.clone()),
+            win_x: 1920,
+            win_y: 120,
+            win_w: 1227,
+            win_h: 632,
+            win_pid: 39175,
+            atspi_role: Some("list".to_string()),
+            is_interactive_atspi: false,
+            from_kwin: true,
+            ..Default::default()
+        };
+        assert!(!tracker.is_interactive_probe(&empty_space_probe, &cfg));
+
+        // 3. Fallback when AT-SPI2 is unavailable: Dolphin's tab bar (rel_y = 60 < 86) is still protected
+        let tab_fallback_probe = PointerProbeResult {
+            cursor_x: 2170,
+            cursor_y: 180,
+            overlay_x: 2170,
+            overlay_y: 180,
+            window: Some(dolphin_win),
+            win_x: 1920,
+            win_y: 120,
+            win_w: 1227,
+            win_h: 632,
+            atspi_role: None,
+            is_interactive_atspi: false,
+            from_kwin: true,
+            ..Default::default()
+        };
+        assert!(is_interactive_window_chrome(&tab_fallback_probe, &cfg));
+        assert!(tracker.is_interactive_probe(&tab_fallback_probe, &cfg));
     }
 }

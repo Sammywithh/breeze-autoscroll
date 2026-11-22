@@ -3,6 +3,7 @@
 //! Windows-style middle-click autoscroll for Kubuntu 26.04 (KDE Plasma 6 / Breeze)
 //! with two-layer 3D/CAD orbit protection (Onshape, Bambu Studio, FreeCAD, Blender, etc.).
 
+mod atspi_inspector;
 mod config;
 mod indicator;
 mod input_manager;
