@@ -3,7 +3,10 @@
 //! Works across KDE Plasma 6 (Wayland + KWin Scripting / D-Bus) and X11 / XWayland (`x11rb`).
 
 use std::env;
-use std::fs;
+use std::ffi::CStr;
+use std::fs::{self, File, OpenOptions};
+use std::os::fd::{AsRawFd, RawFd};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Condvar, Mutex};
@@ -11,6 +14,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use x11rb::connection::Connection as X11Connection;
+use x11rb::protocol::xfixes::ConnectionExt as _;
 use x11rb::protocol::xproto::{AtomEnum, ConnectionExt as _, Window};
 use x11rb::rust_connection::RustConnection;
 use zbus::{Connection, Proxy};
@@ -20,6 +24,8 @@ use crate::config::ConfigData;
 const KWIN_TRACKER_SCRIPT_NAME: &str = "breeze_autoscroll_tracker";
 const KWIN_CURSOR_LIVE_SCRIPT_NAME: &str = "breeze_autoscroll_cursor_live";
 const PROBE_TIMEOUT_MS: u64 = 80;
+/// Client-side headerbar height for frameless non-browser CSD applications (GTK4/Libadwaita/Electron).
+const CSD_HEADERBAR_HEIGHT_PX: i32 = 38;
 
 /// Metadata about an application window (including active browser tab title).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -31,7 +37,8 @@ pub struct ActiveWindowInfo {
     pub updated_at_ms: u64,
 }
 
-/// Snapshot of pointer coordinates and target window captured right when `BTN_MIDDLE` is pressed.
+/// Snapshot of pointer coordinates, target window geometry, and cursor shape captured
+/// right when `BTN_MIDDLE` is pressed.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PointerProbeResult {
     /// Logical compositor pointer X (or X11 root X).
@@ -44,8 +51,26 @@ pub struct PointerProbeResult {
     pub overlay_y: i32,
     /// Window directly under the pointer (or active window fallback).
     pub window: Option<ActiveWindowInfo>,
-    /// True if the pointer was clicked on a desktop wallpaper, dock, or panel.
+    /// True if the pointer was clicked on a desktop wallpaper, dock, panel, menu, or popup.
     pub is_dock_or_desktop: bool,
+    /// Client area X of the window under the cursor (in logical compositor coordinates).
+    pub win_x: i32,
+    /// Client area Y of the window under the cursor (in logical compositor coordinates).
+    pub win_y: i32,
+    /// Client area width of the window under the cursor.
+    pub win_w: i32,
+    /// Client area height of the window under the cursor.
+    pub win_h: i32,
+    /// True when the target window is in fullscreen mode.
+    pub is_fullscreen: bool,
+    /// True when the target window uses client-side decorations (`noBorder == true`).
+    pub no_border: bool,
+    /// Detected cursor hotspot X (`~16` for `pointer`/`pointing_hand`, `~4` for `default`).
+    pub hotspot_x: Option<i32>,
+    /// Detected cursor hotspot Y (`~4` for `pointer`/`default`, `~15` for `text`).
+    pub hotspot_y: Option<i32>,
+    /// True when the cursor shape is a hyperlink/button pointer (`pointing_hand` / `pointer` / `hand2`).
+    pub is_interactive_cursor: bool,
     /// True when coordinates came directly from KWin's live compositor state.
     pub from_kwin: bool,
 }
@@ -57,6 +82,240 @@ struct TrackerState {
     kwin_virtual_size: Option<(i32, i32)>,
     probe_seq: u64,
     last_probe: Option<PointerProbeResult>,
+    window_context_changed: bool,
+}
+
+// ============================================================================
+// Linux DRM Hardware Cursor Plane Inspector (Wayland Cursor Hotspot Detection)
+// ============================================================================
+
+const DRM_CLIENT_CAP_UNIVERSAL_PLANES: u64 = 1;
+const DRM_CLIENT_CAP_ATOMIC: u64 = 3;
+const DRM_MODE_OBJECT_PLANE: u32 = 0xeeeeeeee;
+const DRM_PLANE_TYPE_CURSOR: u64 = 2;
+
+#[repr(C)]
+struct DrmModePlaneRes {
+    count_planes: u32,
+    planes: *mut u32,
+}
+
+#[repr(C)]
+struct DrmModePlane {
+    count_formats: u32,
+    formats: *mut u32,
+    plane_id: u32,
+    crtc_id: u32,
+    fb_id: u32,
+    crtc_x: i32,
+    crtc_y: i32,
+    x: u32,
+    y: u32,
+    possible_crtcs: u32,
+    gamma_size: u32,
+}
+
+#[repr(C)]
+struct DrmModeObjectProperties {
+    count_props: u32,
+    props: *mut u32,
+    prop_values: *mut u64,
+}
+
+#[repr(C)]
+struct DrmModePropertyRes {
+    prop_id: u32,
+    flags: u32,
+    name: [libc::c_char; 32],
+    count_values: libc::c_int,
+    values: *mut u64,
+    count_enums: libc::c_int,
+    enums: *mut libc::c_void,
+    count_blobs: libc::c_int,
+    blob_ids: *mut u32,
+}
+
+type FnDrmSetClientCap = unsafe extern "C" fn(libc::c_int, u64, u64) -> libc::c_int;
+type FnDrmModeGetPlaneResources = unsafe extern "C" fn(libc::c_int) -> *mut DrmModePlaneRes;
+type FnDrmModeFreePlaneResources = unsafe extern "C" fn(*mut DrmModePlaneRes);
+type FnDrmModeGetPlane = unsafe extern "C" fn(libc::c_int, u32) -> *mut DrmModePlane;
+type FnDrmModeFreePlane = unsafe extern "C" fn(*mut DrmModePlane);
+type FnDrmModeObjectGetProperties =
+    unsafe extern "C" fn(libc::c_int, u32, u32) -> *mut DrmModeObjectProperties;
+type FnDrmModeFreeObjectProperties = unsafe extern "C" fn(*mut DrmModeObjectProperties);
+type FnDrmModeGetProperty = unsafe extern "C" fn(libc::c_int, u32) -> *mut DrmModePropertyRes;
+type FnDrmModeFreeProperty = unsafe extern "C" fn(*mut DrmModePropertyRes);
+
+struct CursorPlaneInfo {
+    plane_id: u32,
+    crtc_x_prop: u32,
+    crtc_y_prop: u32,
+}
+
+struct DrmCursorInspector {
+    _file: File,
+    fd: RawFd,
+    cursor_planes: Vec<CursorPlaneInfo>,
+    get_plane: FnDrmModeGetPlane,
+    free_plane: FnDrmModeFreePlane,
+    get_obj_props: FnDrmModeObjectGetProperties,
+    free_obj_props: FnDrmModeFreeObjectProperties,
+}
+
+unsafe impl Send for DrmCursorInspector {}
+
+impl DrmCursorInspector {
+    fn open() -> Option<Self> {
+        unsafe {
+            let handle = libc::dlopen(c"libdrm.so.2".as_ptr(), libc::RTLD_LAZY);
+            if handle.is_null() {
+                return None;
+            }
+
+            let set_cap: FnDrmSetClientCap =
+                std::mem::transmute(load_sym(handle, c"drmSetClientCap")?);
+            let get_res: FnDrmModeGetPlaneResources =
+                std::mem::transmute(load_sym(handle, c"drmModeGetPlaneResources")?);
+            let free_res: FnDrmModeFreePlaneResources =
+                std::mem::transmute(load_sym(handle, c"drmModeFreePlaneResources")?);
+            let get_plane: FnDrmModeGetPlane =
+                std::mem::transmute(load_sym(handle, c"drmModeGetPlane")?);
+            let free_plane: FnDrmModeFreePlane =
+                std::mem::transmute(load_sym(handle, c"drmModeFreePlane")?);
+            let get_obj_props: FnDrmModeObjectGetProperties =
+                std::mem::transmute(load_sym(handle, c"drmModeObjectGetProperties")?);
+            let free_obj_props: FnDrmModeFreeObjectProperties =
+                std::mem::transmute(load_sym(handle, c"drmModeFreeObjectProperties")?);
+            let get_prop: FnDrmModeGetProperty =
+                std::mem::transmute(load_sym(handle, c"drmModeGetProperty")?);
+            let free_prop: FnDrmModeFreeProperty =
+                std::mem::transmute(load_sym(handle, c"drmModeFreeProperty")?);
+
+            for card_idx in 0..4 {
+                let path = format!("/dev/dri/card{card_idx}");
+                let Ok(file) = OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_CLOEXEC)
+                    .open(&path)
+                else {
+                    continue;
+                };
+                let fd = file.as_raw_fd();
+                let _ = set_cap(fd, DRM_CLIENT_CAP_UNIVERSAL_PLANES, 1);
+                let _ = set_cap(fd, DRM_CLIENT_CAP_ATOMIC, 1);
+
+                let res_ptr = get_res(fd);
+                if res_ptr.is_null() {
+                    continue;
+                }
+                let count = (*res_ptr).count_planes as usize;
+                let plane_ids = std::slice::from_raw_parts((*res_ptr).planes, count).to_vec();
+                free_res(res_ptr);
+
+                let mut cursor_planes = Vec::new();
+                for pid in plane_ids {
+                    let props_ptr = get_obj_props(fd, pid, DRM_MODE_OBJECT_PLANE);
+                    if props_ptr.is_null() {
+                        continue;
+                    }
+                    let nprops = (*props_ptr).count_props as usize;
+                    let prop_ids = std::slice::from_raw_parts((*props_ptr).props, nprops);
+                    let prop_vals = std::slice::from_raw_parts((*props_ptr).prop_values, nprops);
+
+                    let mut plane_type = 0u64;
+                    let mut crtc_x_prop = 0u32;
+                    let mut crtc_y_prop = 0u32;
+
+                    for i in 0..nprops {
+                        let p_ptr = get_prop(fd, prop_ids[i]);
+                        if p_ptr.is_null() {
+                            continue;
+                        }
+                        let name_cstr = CStr::from_ptr((*p_ptr).name.as_ptr());
+                        if let Ok(name) = name_cstr.to_str() {
+                            match name {
+                                "type" => plane_type = prop_vals[i],
+                                "CRTC_X" => crtc_x_prop = prop_ids[i],
+                                "CRTC_Y" => crtc_y_prop = prop_ids[i],
+                                _ => {}
+                            }
+                        }
+                        free_prop(p_ptr);
+                    }
+                    free_obj_props(props_ptr);
+
+                    if plane_type == DRM_PLANE_TYPE_CURSOR && crtc_x_prop != 0 && crtc_y_prop != 0 {
+                        cursor_planes.push(CursorPlaneInfo {
+                            plane_id: pid,
+                            crtc_x_prop,
+                            crtc_y_prop,
+                        });
+                    }
+                }
+
+                if !cursor_planes.is_empty() {
+                    return Some(Self {
+                        _file: file,
+                        fd,
+                        cursor_planes,
+                        get_plane,
+                        free_plane,
+                        get_obj_props,
+                        free_obj_props,
+                    });
+                }
+            }
+            None
+        }
+    }
+
+    /// Queries the active hardware cursor plane (`fb_id != 0`) for its CRTC-local `(CRTC_X, CRTC_Y)`.
+    fn query_active_cursor_crtc_pos(&self) -> Option<(i32, i32)> {
+        unsafe {
+            for cp in &self.cursor_planes {
+                let plane_ptr = (self.get_plane)(self.fd, cp.plane_id);
+                if plane_ptr.is_null() {
+                    continue;
+                }
+                let fb_id = (*plane_ptr).fb_id;
+                let crtc_id = (*plane_ptr).crtc_id;
+                (self.free_plane)(plane_ptr);
+
+                if fb_id == 0 || crtc_id == 0 {
+                    continue;
+                }
+
+                let props_ptr = (self.get_obj_props)(self.fd, cp.plane_id, DRM_MODE_OBJECT_PLANE);
+                if props_ptr.is_null() {
+                    continue;
+                }
+                let nprops = (*props_ptr).count_props as usize;
+                let prop_ids = std::slice::from_raw_parts((*props_ptr).props, nprops);
+                let prop_vals = std::slice::from_raw_parts((*props_ptr).prop_values, nprops);
+
+                let mut crtc_x: Option<i32> = None;
+                let mut crtc_y: Option<i32> = None;
+                for i in 0..nprops {
+                    if prop_ids[i] == cp.crtc_x_prop {
+                        crtc_x = Some(prop_vals[i] as u32 as i32);
+                    } else if prop_ids[i] == cp.crtc_y_prop {
+                        crtc_y = Some(prop_vals[i] as u32 as i32);
+                    }
+                }
+                (self.free_obj_props)(props_ptr);
+
+                if let (Some(cx), Some(cy)) = (crtc_x, crtc_y) {
+                    return Some((cx, cy));
+                }
+            }
+            None
+        }
+    }
+}
+
+unsafe fn load_sym(handle: *mut libc::c_void, name: &CStr) -> Option<*mut libc::c_void> {
+    let ptr = unsafe { libc::dlsym(handle, name.as_ptr()) };
+    (!ptr.is_null()).then_some(ptr)
 }
 
 struct X11Client {
@@ -72,6 +331,10 @@ impl X11Client {
             return None;
         }
         let (conn, screen_num) = x11rb::connect(None).ok()?;
+        let _ = conn
+            .xfixes_query_version(5, 0)
+            .ok()
+            .and_then(|c| c.reply().ok());
         let (root, root_width, root_height) = {
             let screen = conn.setup().roots.get(screen_num)?;
             (
@@ -96,6 +359,19 @@ impl X11Client {
         let cookie = self.conn.query_pointer(self.root).map_err(|_| ())?;
         let reply = cookie.reply().map_err(|_| ())?;
         Ok(Some((reply.root_x as i32, reply.root_y as i32)))
+    }
+
+    fn query_cursor_hotspot_and_interactive(&self) -> Result<Option<((i32, i32), bool)>, ()> {
+        let cookie = self
+            .conn
+            .xfixes_get_cursor_image_and_name()
+            .map_err(|_| ())?;
+        let reply = cookie.reply().map_err(|_| ())?;
+        let hx = reply.xhot as i32;
+        let hy = reply.yhot as i32;
+        let name = String::from_utf8_lossy(&reply.name);
+        let interactive = is_pointer_hand_name(&name) || is_pointer_hand_hotspot(hx, hy);
+        Ok(Some(((hx, hy), interactive)))
     }
 
     fn query_active_window(&self) -> Result<Option<ActiveWindowInfo>, ()> {
@@ -145,6 +421,7 @@ struct BridgeHandle {
 pub struct WindowTracker {
     sync: Arc<(Mutex<TrackerState>, Condvar)>,
     x11: Arc<Mutex<Option<X11Client>>>,
+    drm: Arc<Mutex<Option<DrmCursorInspector>>>,
     bridge: Arc<Mutex<Option<BridgeHandle>>>,
 }
 
@@ -159,6 +436,7 @@ impl WindowTracker {
         Self {
             sync: Arc::new((Mutex::new(TrackerState::default()), Condvar::new())),
             x11: Arc::new(Mutex::new(None)),
+            drm: Arc::new(Mutex::new(None)),
             bridge: Arc::new(Mutex::new(None)),
         }
     }
@@ -235,6 +513,15 @@ impl WindowTracker {
         desktop_file: String,
         title: String,
         is_dock_or_desktop: bool,
+        win_x: i32,
+        win_y: i32,
+        win_w: i32,
+        win_h: i32,
+        is_fullscreen: bool,
+        no_border: bool,
+        screen_x: i32,
+        screen_y: i32,
+        screen_scale: f64,
     ) {
         let x11_size = self.x11_root_size();
         let (overlay_x, overlay_y) = scale_kwin_to_x11(
@@ -243,6 +530,24 @@ impl WindowTracker {
             (virt_w > 0 && virt_h > 0).then_some((virt_w, virt_h)),
             x11_size,
         );
+
+        let scale = if screen_scale > 0.1 {
+            screen_scale
+        } else {
+            1.0
+        };
+        let (hotspot_x, hotspot_y, is_interactive_cursor) =
+            if let Some((crtc_x, crtc_y)) = self.query_drm_cursor_crtc_pos() {
+                let local_x = ((cursor_x - screen_x) as f64 * scale).round() as i32;
+                let local_y = ((cursor_y - screen_y) as f64 * scale).round() as i32;
+                let hx = local_x - crtc_x;
+                let hy = local_y - crtc_y;
+                (Some(hx), Some(hy), is_pointer_hand_hotspot(hx, hy))
+            } else if let Some(((hx, hy), interactive)) = self.query_x11_cursor_hotspot() {
+                (Some(hx), Some(hy), interactive)
+            } else {
+                (None, None, false)
+            };
 
         let window = if app_class.is_empty()
             && app_name.is_empty()
@@ -267,6 +572,15 @@ impl WindowTracker {
             overlay_y,
             window,
             is_dock_or_desktop,
+            win_x,
+            win_y,
+            win_w,
+            win_h,
+            is_fullscreen,
+            no_border,
+            hotspot_x,
+            hotspot_y,
+            is_interactive_cursor,
             from_kwin: true,
         };
 
@@ -276,6 +590,7 @@ impl WindowTracker {
             if virt_w > 0 && virt_h > 0 {
                 guard.kwin_virtual_size = Some((virt_w, virt_h));
             }
+            guard.window_context_changed = false;
             guard.probe_seq = guard.probe_seq.wrapping_add(1);
             guard.last_probe = Some(result);
             cvar.notify_all();
@@ -287,6 +602,26 @@ impl WindowTracker {
         let (lock, _) = &*self.sync;
         if let Ok(mut guard) = lock.lock() {
             guard.kwin_cursor = Some((cursor_x, cursor_y));
+        }
+    }
+
+    /// Records that the target window's title/tab or active focus changed right after a middle-click.
+    pub fn notify_window_context_changed(&self) {
+        let (lock, _) = &*self.sync;
+        if let Ok(mut guard) = lock.lock() {
+            guard.window_context_changed = true;
+        }
+    }
+
+    /// Atomically reads and clears the window context changed flag.
+    pub fn take_window_context_changed(&self) -> bool {
+        let (lock, _) = &*self.sync;
+        if let Ok(mut guard) = lock.lock() {
+            let changed = guard.window_context_changed;
+            guard.window_context_changed = false;
+            changed
+        } else {
+            false
         }
     }
 
@@ -302,7 +637,12 @@ impl WindowTracker {
         if let Some(tx) = bridge_tx {
             let baseline_seq = {
                 let (lock, _) = &*self.sync;
-                lock.lock().map(|g| g.probe_seq).unwrap_or(0)
+                lock.lock()
+                    .map(|mut g| {
+                        g.window_context_changed = false;
+                        g.probe_seq
+                    })
+                    .unwrap_or(0)
             };
 
             if tx.send(BridgeCmd::StartLiveCursorAndProbe).is_ok() {
@@ -340,6 +680,11 @@ impl WindowTracker {
             }
         }
 
+        let (x11_hs, x11_interactive) = self
+            .query_x11_cursor_hotspot()
+            .map(|((hx, hy), inter)| ((Some(hx), Some(hy)), inter))
+            .unwrap_or(((None, None), false));
+
         // Fallback path: pure X11 (when not on Wayland) or cached KWin state if KWin probe timed out
         if !is_wayland_session()
             && let Some((cx, cy)) = self.query_x11_cursor()
@@ -351,7 +696,11 @@ impl WindowTracker {
                 overlay_y: cy,
                 window: self.get_active_window(),
                 is_dock_or_desktop: false,
+                hotspot_x: x11_hs.0,
+                hotspot_y: x11_hs.1,
+                is_interactive_cursor: x11_interactive,
                 from_kwin: false,
+                ..Default::default()
             };
         }
 
@@ -374,6 +723,7 @@ impl WindowTracker {
                 window: active_win.or_else(|| self.query_x11_active()),
                 is_dock_or_desktop: false,
                 from_kwin: false,
+                ..Default::default()
             };
         }
 
@@ -385,7 +735,11 @@ impl WindowTracker {
                 overlay_y: cy,
                 window: active_win.or_else(|| self.query_x11_active()),
                 is_dock_or_desktop: false,
+                hotspot_x: x11_hs.0,
+                hotspot_y: x11_hs.1,
+                is_interactive_cursor: x11_interactive,
                 from_kwin: false,
+                ..Default::default()
             };
         }
 
@@ -397,6 +751,7 @@ impl WindowTracker {
             window: active_win,
             is_dock_or_desktop: false,
             from_kwin: false,
+            ..Default::default()
         }
     }
 
@@ -461,6 +816,19 @@ impl WindowTracker {
         self.query_x11_active()
     }
 
+    /// Checks whether a probe result falls on interactive window chrome (server-side titlebar,
+    /// browser tab bar / address bar, or CSD headerbar) or over a hyperlink/button pointer cursor.
+    pub fn is_interactive_probe(
+        &self,
+        probe: &PointerProbeResult,
+        config: &ConfigData,
+    ) -> bool {
+        if !config.ignore_hyperlinks_and_tabs {
+            return false;
+        }
+        is_interactive_window_chrome(probe, config) || probe.is_interactive_cursor
+    }
+
     /// Checks whether a probe result (preferring the window directly under the cursor)
     /// belongs to an excluded 3D/CAD/Slicer context.
     pub fn check_probe_excluded(
@@ -492,6 +860,18 @@ impl WindowTracker {
         match_excluded_3d_context(&info, &config.excluded_apps_and_titles)
     }
 
+    fn query_drm_cursor_crtc_pos(&self) -> Option<(i32, i32)> {
+        let Ok(mut guard) = self.drm.lock() else {
+            return None;
+        };
+        if guard.is_none() {
+            *guard = DrmCursorInspector::open();
+        }
+        guard
+            .as_ref()
+            .and_then(|inspector| inspector.query_active_cursor_crtc_pos())
+    }
+
     fn with_x11<T, F: Fn(&X11Client) -> Result<Option<T>, ()>>(&self, f: F) -> Option<T> {
         let Ok(mut guard) = self.x11.lock() else {
             return None;
@@ -521,9 +901,107 @@ impl WindowTracker {
         self.with_x11(|c| c.query_pointer())
     }
 
+    fn query_x11_cursor_hotspot(&self) -> Option<((i32, i32), bool)> {
+        self.with_x11(|c| c.query_cursor_hotspot_and_interactive())
+    }
+
     fn query_x11_active(&self) -> Option<ActiveWindowInfo> {
         self.with_x11(|c| c.query_active_window())
     }
+}
+
+/// Returns true when the cursor hotspot `(hx, hy)` matches the pointing-hand (`pointer` /
+/// `pointing_hand` / `hand2`) cursor used for hyperlinks (`<a href>`) and interactive buttons.
+///
+/// Across cursor sizes `12px..72px`:
+/// - `default` (`left_ptr`): `hx == hy` (e.g. `(4, 4)` at 24px)
+/// - `text` (`ibeam`): `hx ≈ hy` (e.g. `(16, 15)` at 24px)
+/// - `pointer` (`pointing_hand`): `hx ≈ 4 * hy` (e.g. `(16, 4)` at 24px, `(24, 6)` at 36px, `(33, 8)` at 48px)
+pub fn is_pointer_hand_hotspot(hx: i32, hy: i32) -> bool {
+    (9..=56).contains(&hx) && (1..=15).contains(&hy) && hx >= 2 * hy + 4
+}
+
+/// Returns true when an X11/XFixes cursor name identifies a link/button hand pointer.
+pub fn is_pointer_hand_name(name: &str) -> bool {
+    let trimmed = name.trim().to_ascii_lowercase();
+    matches!(
+        trimmed.as_str(),
+        "pointer" | "pointing_hand" | "hand2" | "hand1" | "hand"
+    )
+}
+
+/// Returns true when the window metadata identifies a web browser where the top area
+/// of the client rectangle contains the tab strip and navigation/address bar.
+pub fn is_browser_window(info: &ActiveWindowInfo) -> bool {
+    const BROWSER_TOKENS: &[&str] = &[
+        "firefox",
+        "librewolf",
+        "waterfox",
+        "floorp",
+        "zen",
+        "navigator",
+        "tor browser",
+        "brave",
+        "chrome",
+        "chromium",
+        "msedge",
+        "microsoft-edge",
+        "vivaldi",
+        "opera",
+        "epiphany",
+        "falkon",
+        "thorium",
+    ];
+    let fields = [
+        info.app_class.to_ascii_lowercase(),
+        info.app_name.to_ascii_lowercase(),
+        info.desktop_file.to_ascii_lowercase(),
+    ];
+    BROWSER_TOKENS
+        .iter()
+        .any(|token| fields.iter().any(|f| f.contains(token)))
+}
+
+/// Returns true when `probe` was clicked on a window titlebar, frame decoration,
+/// browser tab bar / address bar, or CSD headerbar.
+pub fn is_interactive_window_chrome(
+    probe: &PointerProbeResult,
+    config: &ConfigData,
+) -> bool {
+    if !config.ignore_hyperlinks_and_tabs {
+        return false;
+    }
+    if probe.win_w <= 0 || probe.win_h <= 0 {
+        return false;
+    }
+
+    // 1. Click outside the window's clientGeometry (e.g., server-side KWin titlebar or border)
+    if probe.cursor_x < probe.win_x
+        || probe.cursor_x >= probe.win_x + probe.win_w
+        || probe.cursor_y < probe.win_y
+        || probe.cursor_y >= probe.win_y + probe.win_h
+    {
+        return true;
+    }
+
+    if probe.is_fullscreen {
+        return false;
+    }
+
+    let rel_y = probe.cursor_y - probe.win_y;
+
+    // 2. Web browser top chrome (Tab strip + Navigation/Address bar)
+    if probe.window.as_ref().is_some_and(is_browser_window) {
+        let top_chrome = config.browser_top_chrome_px as i32;
+        if rel_y >= 0 && rel_y < top_chrome {
+            return true;
+        }
+    } else if probe.no_border && rel_y >= 0 && rel_y < CSD_HEADERBAR_HEIGHT_PX {
+        // 3. Frameless CSD application window headerbar
+        return true;
+    }
+
+    false
 }
 
 /// Returns true when running inside a Wayland session.
@@ -890,6 +1368,17 @@ const KWIN_CURSOR_LIVE_JS: &str = r#"
         return workspace.activeWindow;
     }
 
+    function notifyContextChanged() {
+        try {
+            callDBus(
+                "org.breeze.Autoscroll",
+                "/Autoscroll",
+                "org.breeze.Autoscroll",
+                "NotifyWindowContextChanged"
+            );
+        } catch (e) {}
+    }
+
     function sendProbe() {
         var p = workspace.cursorPos;
         var cx = p ? Math.round(p.x) : 0;
@@ -904,22 +1393,92 @@ const KWIN_CURSOR_LIVE_JS: &str = r#"
         var desktop = "";
         var caption = "";
         var isDockOrDesktop = "0";
+        var wx = 0;
+        var wy = 0;
+        var ww = 0;
+        var wh = 0;
+        var isFullScreen = "0";
+        var noBorder = "0";
 
         if (win) {
             cls = win.resourceClass ? String(win.resourceClass) : "";
             name = win.resourceName ? String(win.resourceName) : "";
             desktop = win.desktopFileName ? String(win.desktopFileName) : "";
             caption = win.caption ? String(win.caption) : "";
-            if (win.dock || win.desktopWindow || win.isDock || win.isDesktop) {
+            if (
+                win.dock ||
+                win.desktopWindow ||
+                win.isDock ||
+                win.isDesktop ||
+                win.toolbar ||
+                win.menu ||
+                win.dropdownMenu ||
+                win.popupMenu ||
+                win.comboBox ||
+                win.tooltip ||
+                win.notification ||
+                win.criticalNotification ||
+                win.appletPopup ||
+                win.onScreenDisplay ||
+                win.popupWindow ||
+                win.specialWindow ||
+                win.splash
+            ) {
                 isDockOrDesktop = "1";
             } else if ((cls === "plasmashell" || name === "plasmashell") && !win.normalWindow && !win.dialog) {
                 isDockOrDesktop = "1";
             }
+
+            var cg = win.clientGeometry || win.frameGeometry || win.bufferGeometry;
+            if (cg) {
+                wx = Math.round(cg.x);
+                wy = Math.round(cg.y);
+                ww = Math.round(cg.width);
+                wh = Math.round(cg.height);
+            }
+            if (win.fullScreen) {
+                isFullScreen = "1";
+            }
+            if (win.noBorder) {
+                noBorder = "1";
+            }
+            if (win.captionChanged) {
+                win.captionChanged.connect(notifyContextChanged);
+            }
         }
+
+        if (workspace.windowActivated) {
+            workspace.windowActivated.connect(notifyContextChanged);
+        }
+
+        var sx = 0;
+        var sy = 0;
+        var sScale = "1";
+        try {
+            var scr = null;
+            if (p && typeof workspace.screenAt === "function") {
+                scr = workspace.screenAt(p);
+            }
+            if (!scr && win && win.output) {
+                scr = win.output;
+            }
+            if (scr) {
+                if (scr.geometry) {
+                    sx = Math.round(scr.geometry.x);
+                    sy = Math.round(scr.geometry.y);
+                }
+                if (scr.devicePixelRatio) {
+                    sScale = String(scr.devicePixelRatio);
+                }
+            }
+        } catch (e) {}
 
         lastX = cx;
         lastY = cy;
         lastSentMs = Date.now();
+
+        var winGeom = String(wx) + "," + String(wy) + "," + String(ww) + "," + String(wh) + "," + isFullScreen + "," + noBorder;
+        var screenGeom = String(sx) + "," + String(sy) + "," + sScale;
 
         callDBus(
             "org.breeze.Autoscroll",
@@ -928,7 +1487,8 @@ const KWIN_CURSOR_LIVE_JS: &str = r#"
             "ReportPointerProbe",
             String(cx), String(cy),
             String(vw), String(vh),
-            cls, name, desktop, caption, isDockOrDesktop
+            cls, name, desktop, caption, isDockOrDesktop,
+            winGeom, screenGeom
         );
     }
 
@@ -1138,11 +1698,122 @@ mod tests {
             }),
             is_dock_or_desktop: false,
             from_kwin: true,
+            ..Default::default()
         };
 
         assert_eq!(
             tracker.check_probe_excluded(&probe, &cfg),
             Some("onshape".to_string())
         );
+    }
+
+    #[test]
+    fn distinguishes_pointer_hand_hotspot_from_default_and_text_cursors() {
+        // Hyperlink / interactive button hand cursor (pointer / pointing_hand / hand2) across sizes
+        assert!(is_pointer_hand_hotspot(12, 3)); // 18px
+        assert!(is_pointer_hand_hotspot(16, 4)); // 24px (Breeze default)
+        assert!(is_pointer_hand_hotspot(17, 4)); // 24px with 1px rounding
+        assert!(is_pointer_hand_hotspot(24, 6)); // 36px
+        assert!(is_pointer_hand_hotspot(33, 8)); // 48px
+
+        // Standard arrow (default / left_ptr)
+        assert!(!is_pointer_hand_hotspot(4, 4)); // 24px
+        assert!(!is_pointer_hand_hotspot(6, 6)); // 36px
+        assert!(!is_pointer_hand_hotspot(8, 8)); // 48px
+
+        // Text / I-Beam (text / xterm) and Openhand / Grab
+        assert!(!is_pointer_hand_hotspot(16, 15)); // 24px text
+        assert!(!is_pointer_hand_hotspot(17, 16)); // 24px text/crosshair
+        assert!(!is_pointer_hand_hotspot(16, 16)); // 24px grab
+        assert!(!is_pointer_hand_hotspot(24, 23)); // 36px text
+    }
+
+    #[test]
+    fn detects_firefox_and_brave_tab_bar_and_hyperlink_probes() {
+        let tracker = WindowTracker::new();
+        let mut cfg = ConfigData::default();
+
+        let firefox_win = ActiveWindowInfo {
+            app_class: "firefox_firefox".to_string(),
+            app_name: "Navigator".to_string(),
+            desktop_file: "firefox_firefox".to_string(),
+            title: "Rust Programming Language — Mozilla Firefox".to_string(),
+            updated_at_ms: 0,
+        };
+
+        // 1. Middle-clicking a Firefox tab (y = 142 within window at y = 120 -> rel_y = 22 < 95)
+        let tab_probe = PointerProbeResult {
+            cursor_x: 2200,
+            cursor_y: 142,
+            overlay_x: 2200,
+            overlay_y: 142,
+            window: Some(firefox_win.clone()),
+            win_x: 1920,
+            win_y: 120,
+            win_w: 1920,
+            win_h: 1080,
+            is_fullscreen: false,
+            no_border: true,
+            is_interactive_cursor: false,
+            from_kwin: true,
+            ..Default::default()
+        };
+        assert!(is_interactive_window_chrome(&tab_probe, &cfg));
+        assert!(tracker.is_interactive_probe(&tab_probe, &cfg));
+
+        // 2. Middle-clicking a hyperlink inside the page (rel_y = 400, is_interactive_cursor = true)
+        let link_probe = PointerProbeResult {
+            cursor_x: 2450,
+            cursor_y: 520,
+            overlay_x: 2450,
+            overlay_y: 520,
+            window: Some(firefox_win.clone()),
+            win_x: 1920,
+            win_y: 120,
+            win_w: 1920,
+            win_h: 1080,
+            is_fullscreen: false,
+            no_border: true,
+            hotspot_x: Some(16),
+            hotspot_y: Some(4),
+            is_interactive_cursor: true,
+            from_kwin: true,
+            ..Default::default()
+        };
+        assert!(!is_interactive_window_chrome(&link_probe, &cfg));
+        assert!(tracker.is_interactive_probe(&link_probe, &cfg));
+
+        // 3. Middle-clicking a non-interactive area of the page (rel_y = 400, default cursor)
+        let page_probe = PointerProbeResult {
+            cursor_x: 2450,
+            cursor_y: 520,
+            overlay_x: 2450,
+            overlay_y: 520,
+            window: Some(firefox_win),
+            win_x: 1920,
+            win_y: 120,
+            win_w: 1920,
+            win_h: 1080,
+            is_fullscreen: false,
+            no_border: true,
+            hotspot_x: Some(4),
+            hotspot_y: Some(4),
+            is_interactive_cursor: false,
+            from_kwin: true,
+            ..Default::default()
+        };
+        assert!(!is_interactive_window_chrome(&page_probe, &cfg));
+        assert!(!tracker.is_interactive_probe(&page_probe, &cfg));
+
+        // 4. Disabling ignore_hyperlinks_and_tabs allows all probes
+        cfg.ignore_hyperlinks_and_tabs = false;
+        assert!(!tracker.is_interactive_probe(&tab_probe, &cfg));
+        assert!(!tracker.is_interactive_probe(&link_probe, &cfg));
+
+        // 5. Window context change notification lifecycle
+        assert!(!tracker.take_window_context_changed());
+        tracker.notify_window_context_changed();
+        assert!(tracker.take_window_context_changed());
+        assert!(!tracker.take_window_context_changed());
     }
 }

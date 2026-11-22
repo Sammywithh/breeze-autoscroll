@@ -265,12 +265,28 @@ impl AutoscrollControlIface {
         desktop_file: String,
         title: String,
         is_dock_or_desktop: String,
+        win_geom: String,
+        screen_geom: String,
     ) {
         let cx = cursor_x.trim().parse::<i32>().unwrap_or(0);
         let cy = cursor_y.trim().parse::<i32>().unwrap_or(0);
         let vw = virt_w.trim().parse::<i32>().unwrap_or(0);
         let vh = virt_h.trim().parse::<i32>().unwrap_or(0);
         let dock_or_desktop = is_dock_or_desktop.trim() == "1";
+
+        let mut win_parts = win_geom.split(',');
+        let wx = win_parts.next().and_then(|s| s.trim().parse::<i32>().ok()).unwrap_or(0);
+        let wy = win_parts.next().and_then(|s| s.trim().parse::<i32>().ok()).unwrap_or(0);
+        let ww = win_parts.next().and_then(|s| s.trim().parse::<i32>().ok()).unwrap_or(0);
+        let wh = win_parts.next().and_then(|s| s.trim().parse::<i32>().ok()).unwrap_or(0);
+        let fullscreen = win_parts.next().is_some_and(|s| s.trim() == "1");
+        let borderless = win_parts.next().is_some_and(|s| s.trim() == "1");
+
+        let mut scr_parts = screen_geom.split(',');
+        let sx = scr_parts.next().and_then(|s| s.trim().parse::<i32>().ok()).unwrap_or(0);
+        let sy = scr_parts.next().and_then(|s| s.trim().parse::<i32>().ok()).unwrap_or(0);
+        let s_scale = scr_parts.next().and_then(|s| s.trim().parse::<f64>().ok()).unwrap_or(1.0);
+
         self.state.window_tracker.report_pointer_probe(
             cx,
             cy,
@@ -281,6 +297,15 @@ impl AutoscrollControlIface {
             desktop_file,
             title,
             dock_or_desktop,
+            wx,
+            wy,
+            ww,
+            wh,
+            fullscreen,
+            borderless,
+            sx,
+            sy,
+            s_scale,
         );
     }
 
@@ -294,6 +319,11 @@ impl AutoscrollControlIface {
         }
     }
 
+    #[zbus(name = "NotifyWindowContextChanged")]
+    fn notify_window_context_changed(&self) {
+        self.state.window_tracker.notify_window_context_changed();
+    }
+
     #[zbus(name = "TriggerProbe")]
     fn trigger_probe(&self) {
         self.state.window_tracker.trigger_probe();
@@ -305,18 +335,29 @@ impl AutoscrollControlIface {
         let Some(probe) = self.state.window_tracker.last_probe_snapshot() else {
             return "none".to_string();
         };
+        let cfg = self.state.config.snapshot();
+        let interactive_chrome =
+            crate::window_detector::is_interactive_window_chrome(&probe, &cfg);
         let win_desc = probe
             .window
             .as_ref()
             .map(|w| format!("class='{}' title='{}'", w.app_class, w.title))
             .unwrap_or_else(|| "none".to_string());
         format!(
-            "from_kwin={} cursor=({}, {}) overlay=({}, {}) dock_or_desktop={} {}",
+            "from_kwin={} cursor=({}, {}) overlay=({}, {}) win=({}, {}, {}x{}) hotspot=({:?}, {:?}) interactive_cursor={} interactive_chrome={} dock_or_desktop={} {}",
             probe.from_kwin,
             probe.cursor_x,
             probe.cursor_y,
             probe.overlay_x,
             probe.overlay_y,
+            probe.win_x,
+            probe.win_y,
+            probe.win_w,
+            probe.win_h,
+            probe.hotspot_x,
+            probe.hotspot_y,
+            probe.is_interactive_cursor,
+            interactive_chrome,
             probe.is_dock_or_desktop,
             win_desc
         )
