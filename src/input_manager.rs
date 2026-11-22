@@ -294,8 +294,11 @@ const CONTEXT_CHANGE_CANCEL_WINDOW_MS: u64 = 450;
 #[derive(Debug, Clone, PartialEq)]
 enum ScrollPhase {
     Idle,
-    /// Optional legacy guard mode (`protect_3d_drag = true`): waits `hold_delay_ms`
-    /// and cancels if dragged immediately.
+    /// Short-click passthrough / optional 3D drag guard phase:
+    /// - Releasing before `hold_delay_ms` inside deadzone passes through as a normal middle-click
+    ///   (closing tabs, opening links/folders, primary-selection paste) in EVERY app.
+    /// - Dragging outside the deadzone while held starts Halte-Modus immediately.
+    /// - Holding stationary >= `hold_delay_ms` shows the anchor for Einrast-Modus.
     Pending {
         pressed_at: Instant,
         anchor_x: i32,
@@ -303,6 +306,7 @@ enum ScrollPhase {
         overlay_x: i32,
         overlay_y: i32,
         live_cursor_available: bool,
+        using_absolute_cursor: bool,
         move_x: f32,
         move_y: f32,
     },
@@ -358,7 +362,10 @@ impl ScrollStateMachine {
     pub fn uses_live_cursor(&self) -> bool {
         matches!(
             self.phase,
-            ScrollPhase::Active {
+            ScrollPhase::Pending {
+                live_cursor_available: true,
+                ..
+            } | ScrollPhase::Active {
                 live_cursor_available: true,
                 ..
             }
@@ -367,9 +374,11 @@ impl ScrollStateMachine {
 
     /// Handles `BTN_MIDDLE` press.
     ///
-    /// In standard Windows mode (`protect_3d_drag == false`), shows the anchor immediately at
-    /// `overlay_pos` and distinguishes Einrast-Modus vs Halte-Modus automatically by whether
-    /// the pointer leaves the deadzone while `BTN_MIDDLE` is held.
+    /// With system-wide `short_click_passthrough` (default), enters `Pending`:
+    /// - Quick stationary release (< `hold_delay_ms`, inside deadzone) cancels cleanly so every
+    ///   app receives its native middle-click (close tab, open link/folder, paste).
+    /// - Pulling outside the deadzone while held starts Halte-Modus immediately.
+    /// - Holding stationary >= `hold_delay_ms` displays the anchor for Einrast-Modus.
     pub fn on_middle_down<F>(
         &mut self,
         now: Instant,
@@ -400,7 +409,7 @@ impl ScrollStateMachine {
             return None;
         }
 
-        if config.protect_3d_drag {
+        if config.protect_3d_drag || config.short_click_passthrough {
             self.phase = ScrollPhase::Pending {
                 pressed_at: now,
                 anchor_x: cursor_pos.0,
@@ -408,6 +417,7 @@ impl ScrollStateMachine {
                 overlay_x: overlay_pos.0,
                 overlay_y: overlay_pos.1,
                 live_cursor_available,
+                using_absolute_cursor: false,
                 move_x: 0.0,
                 move_y: 0.0,
             };
@@ -445,22 +455,40 @@ impl ScrollStateMachine {
     /// Updates pointer offset from live compositor / X11 coordinates (`cur - anchor`),
     /// eliminating drift when returning to the anchor symbol.
     pub fn set_absolute_cursor(&mut self, cur_x: i32, cur_y: i32, config: &ConfigData) {
-        if let ScrollPhase::Active {
-            anchor_x,
-            anchor_y,
-            delta_x,
-            delta_y,
-            button_held,
-            exited_deadzone_while_held,
-            using_absolute_cursor,
-            ..
-        } = &mut self.phase
-        {
-            *using_absolute_cursor = true;
-            *delta_x = (cur_x - *anchor_x) as f32;
-            *delta_y = (cur_y - *anchor_y) as f32;
-            if *button_held && is_outside_deadzone(*delta_x, *delta_y, config) {
-                *exited_deadzone_while_held = true;
+        match &mut self.phase {
+            ScrollPhase::Idle => {}
+            ScrollPhase::Pending {
+                anchor_x,
+                anchor_y,
+                move_x,
+                move_y,
+                using_absolute_cursor,
+                ..
+            } => {
+                *using_absolute_cursor = true;
+                *move_x = (cur_x - *anchor_x) as f32;
+                *move_y = (cur_y - *anchor_y) as f32;
+                if config.protect_3d_drag && move_x.hypot(*move_y) >= config.drag_cancel_threshold_px
+                {
+                    self.phase = ScrollPhase::Idle;
+                }
+            }
+            ScrollPhase::Active {
+                anchor_x,
+                anchor_y,
+                delta_x,
+                delta_y,
+                button_held,
+                exited_deadzone_while_held,
+                using_absolute_cursor,
+                ..
+            } => {
+                *using_absolute_cursor = true;
+                *delta_x = (cur_x - *anchor_x) as f32;
+                *delta_y = (cur_y - *anchor_y) as f32;
+                if *button_held && is_outside_deadzone(*delta_x, *delta_y, config) {
+                    *exited_deadzone_while_held = true;
+                }
             }
         }
     }
@@ -469,9 +497,16 @@ impl ScrollStateMachine {
     pub fn on_mouse_move(&mut self, dx: f32, dy: f32, config: &ConfigData) {
         match &mut self.phase {
             ScrollPhase::Idle => {}
-            ScrollPhase::Pending { move_x, move_y, .. } => {
-                *move_x += dx;
-                *move_y += dy;
+            ScrollPhase::Pending {
+                move_x,
+                move_y,
+                using_absolute_cursor,
+                ..
+            } => {
+                if !*using_absolute_cursor {
+                    *move_x += dx;
+                    *move_y += dy;
+                }
 
                 if config.protect_3d_drag {
                     let dist = move_x.hypot(*move_y);
@@ -516,11 +551,16 @@ impl ScrollStateMachine {
                 live_cursor_available,
                 move_x,
                 move_y,
+                ..
             } => {
                 let held = now.saturating_duration_since(*pressed_at);
                 let dist = move_x.hypot(*move_y);
 
-                if config.mode == "toggle"
+                // When system-wide short-click passthrough is enabled, releasing while still
+                // Pending (< hold_delay_ms and inside deadzone) ALWAYS passes through cleanly
+                // as a normal middle-click (close tab, open link/folder, paste) in every app.
+                if !config.short_click_passthrough
+                    && config.mode == "toggle"
                     && held < Duration::from_millis(TOGGLE_CLICK_MAX_MS)
                     && dist < config.drag_cancel_threshold_px
                 {
@@ -687,7 +727,9 @@ impl ScrollStateMachine {
             return commands;
         }
 
-        // Optional legacy hold-delay transition when protect_3d_drag = true
+        // System-wide short-click protection (`short_click_passthrough`) and optional `protect_3d_drag`:
+        // 1. Pulling outside the deadzone while holding BTN_MIDDLE -> instant Halte-Modus activation.
+        // 2. Holding stationary >= `hold_delay_ms` -> anchor appears for Einrast-Modus (or Halte-Modus).
         if let ScrollPhase::Pending {
             pressed_at,
             anchor_x,
@@ -695,12 +737,17 @@ impl ScrollStateMachine {
             overlay_x,
             overlay_y,
             live_cursor_available,
+            using_absolute_cursor,
             move_x,
             move_y,
         } = self.phase
         {
             let elapsed = now.saturating_duration_since(pressed_at);
-            if elapsed >= Duration::from_millis(config.hold_delay_ms) {
+            let outside_deadzone = is_outside_deadzone(move_x, move_y, config);
+            let early_drag_activate = !config.protect_3d_drag && outside_deadzone;
+            let hold_elapsed = elapsed >= Duration::from_millis(config.hold_delay_ms);
+
+            if early_drag_activate || hold_elapsed {
                 let dist = move_x.hypot(move_y);
                 if config.protect_3d_drag && dist >= config.drag_cancel_threshold_px {
                     self.phase = ScrollPhase::Idle;
@@ -712,13 +759,13 @@ impl ScrollStateMachine {
                     last_tick_at: now,
                     anchor_x,
                     anchor_y,
-                    delta_x: 0.0,
-                    delta_y: 0.0,
+                    delta_x: move_x,
+                    delta_y: move_y,
                     button_held: true,
-                    exited_deadzone_while_held: false,
+                    exited_deadzone_while_held: outside_deadzone,
                     has_scrolled: false,
                     live_cursor_available,
-                    using_absolute_cursor: false,
+                    using_absolute_cursor,
                     accum_hires_x: 0.0,
                     accum_hires_y: 0.0,
                     pending_std_hires_x: 0,
@@ -732,8 +779,12 @@ impl ScrollStateMachine {
                     opacity: config.indicator_opacity,
                     allow_horizontal: config.allow_horizontal,
                 });
+                if !early_drag_activate {
+                    return commands;
+                }
+            } else {
+                return commands;
             }
-            return commands;
         }
 
         if let ScrollPhase::Active {
@@ -1144,6 +1195,7 @@ fn run_engine_loop(
 
         let event_now = Instant::now();
         for action in actions {
+            let was_not_idle = !state_machine.is_idle();
             let cmd = match action {
                 RawEvdevAction::MiddleDown => {
                     if !state_machine.is_idle() {
@@ -1185,35 +1237,40 @@ fn run_engine_loop(
                 }
             };
             if let Some(c) = cmd {
-                if matches!(c, IndicatorCommand::Hide) {
-                    window_tracker.stop_live_cursor();
-                }
                 let _ = indicator_tx.send(c);
+            }
+            if was_not_idle && state_machine.is_idle() {
+                window_tracker.stop_live_cursor();
+            }
+        }
+
+        if !state_machine.is_idle() && window_tracker.take_window_context_changed() {
+            let was_not_idle = !state_machine.is_idle();
+            if let Some(cmd) = state_machine.on_window_context_changed(Instant::now(), &cfg) {
+                let _ = indicator_tx.send(cmd);
+            }
+            if was_not_idle && state_machine.is_idle() {
+                window_tracker.stop_live_cursor();
             }
         }
 
         if !state_machine.is_idle()
-            && window_tracker.take_window_context_changed()
-            && let Some(cmd) = state_machine.on_window_context_changed(Instant::now(), &cfg)
-        {
-            if matches!(cmd, IndicatorCommand::Hide) {
-                window_tracker.stop_live_cursor();
-            }
-            let _ = indicator_tx.send(cmd);
-        }
-
-        if state_machine.is_active()
             && state_machine.uses_live_cursor()
             && let Some((cx, cy)) = window_tracker.get_live_cursor_pos()
         {
+            let was_not_idle = !state_machine.is_idle();
             state_machine.set_absolute_cursor(cx, cy, &cfg);
-        }
-
-        for cmd in state_machine.tick(Instant::now(), &cfg, emitter) {
-            if matches!(cmd, IndicatorCommand::Hide) {
+            if was_not_idle && state_machine.is_idle() {
                 window_tracker.stop_live_cursor();
             }
+        }
+
+        let was_not_idle = !state_machine.is_idle();
+        for cmd in state_machine.tick(Instant::now(), &cfg, emitter) {
             let _ = indicator_tx.send(cmd);
+        }
+        if was_not_idle && state_machine.is_idle() {
+            window_tracker.stop_live_cursor();
         }
     }
 
@@ -1319,38 +1376,78 @@ mod tests {
     }
 
     #[test]
-    fn windows_einrast_modus_activates_immediately_on_press_and_latches_on_release_inside_deadzone()
-    {
+    fn system_wide_short_click_passes_through_without_showing_anchor() {
         let mut sm = ScrollStateMachine::new();
         let cfg = ConfigData::default();
         let mut emitter = MockEmitter::default();
         let t0 = Instant::now();
 
-        // Press BTN_MIDDLE -> anchor appears immediately at click coordinates
-        let show = sm.on_middle_down(t0, &cfg, (2500, 600), (2500, 600), true, || None);
+        // Short stationary middle-click (e.g. closing an Obsidian tab or opening a Nautilus folder)
+        assert!(
+            sm.on_middle_down(t0, &cfg, (1200, 300), (1200, 300), true, || None)
+                .is_none()
+        );
+        assert!(sm.is_pending());
+
+        // Minor hand jiggle (7px < deadzone 12px) during 90ms click must NOT activate autoscroll
+        sm.set_absolute_cursor(1205, 305, &cfg);
+        assert!(
+            sm.tick(t0 + Duration::from_millis(50), &cfg, &mut emitter)
+                .is_empty()
+        );
+        assert!(sm.is_pending());
+
+        // Release at 90ms (< 180ms hold_delay_ms) -> returns cleanly to Idle, zero anchor shown
+        assert!(
+            sm.on_middle_up(t0 + Duration::from_millis(90), &cfg)
+                .is_none()
+        );
+        assert!(sm.is_idle());
+        assert!(emitter.events.is_empty());
+    }
+
+    #[test]
+    fn einrast_modus_latches_after_brief_hold_and_release_inside_deadzone() {
+        let mut sm = ScrollStateMachine::new();
+        let cfg = ConfigData::default();
+        let mut emitter = MockEmitter::default();
+        let t0 = Instant::now();
+
+        // Press BTN_MIDDLE -> enters Pending first (protects quick clicks system-wide)
+        assert!(
+            sm.on_middle_down(t0, &cfg, (2500, 600), (2500, 600), true, || None)
+                .is_none()
+        );
+        assert!(sm.is_pending());
+
+        // Hold stationary for hold_delay_ms (180ms) -> anchor appears at exact click coordinates
+        let cmds = sm.tick(t0 + Duration::from_millis(180), &cfg, &mut emitter);
         assert_eq!(
-            show,
-            Some(IndicatorCommand::Show {
+            cmds,
+            vec![IndicatorCommand::Show {
                 anchor_x: 2500,
                 anchor_y: 600,
                 deadzone: 12,
                 theme: "dark".to_string(),
                 opacity: 0.92,
                 allow_horizontal: true,
-            })
+            }]
         );
         assert!(sm.is_active());
 
-        // Small jitter inside deadzone while releasing after 80ms -> latches Einrast-Modus
+        // Small jitter inside deadzone while releasing at 220ms -> latches Einrast-Modus
         sm.set_absolute_cursor(2503, 602, &cfg);
-        assert!(sm.on_middle_up(t0 + Duration::from_millis(80), &cfg).is_none());
+        assert!(
+            sm.on_middle_up(t0 + Duration::from_millis(220), &cfg)
+                .is_none()
+        );
         assert!(sm.is_active());
 
         // Move mouse down 60px -> scrolls smoothly downward
         sm.set_absolute_cursor(2500, 660, &cfg);
         for step in 1..=10 {
             let _ = sm.tick(
-                t0 + Duration::from_millis(80 + step * 16),
+                t0 + Duration::from_millis(220 + step * 16),
                 &cfg,
                 &mut emitter,
             );
@@ -1361,7 +1458,7 @@ mod tests {
         // Return pointer onto anchor deadzone -> zero drift, scrolling stops completely
         emitter.events.clear();
         sm.set_absolute_cursor(2501, 601, &cfg);
-        let _ = sm.tick(t0 + Duration::from_millis(260), &cfg, &mut emitter);
+        let _ = sm.tick(t0 + Duration::from_millis(400), &cfg, &mut emitter);
         assert!(emitter.events.is_empty());
 
         // Any mouse click (e.g. left click / CancelInput) or ESC stops Einrast-Modus
@@ -1370,18 +1467,29 @@ mod tests {
     }
 
     #[test]
-    fn windows_halte_modus_scrolls_while_held_outside_deadzone_and_stops_on_release() {
+    fn windows_halte_modus_activates_immediately_on_drag_and_stops_on_release() {
         let mut sm = ScrollStateMachine::new();
         let cfg = ConfigData::default();
         let mut emitter = MockEmitter::default();
         let t0 = Instant::now();
 
-        let show = sm.on_middle_down(t0, &cfg, (1000, 500), (1000, 500), true, || None);
-        assert!(matches!(show, Some(IndicatorCommand::Show { .. })));
+        assert!(
+            sm.on_middle_down(t0, &cfg, (1000, 500), (1000, 500), true, || None)
+                .is_none()
+        );
+        assert!(sm.is_pending());
 
-        // Pull mouse directly out of deadzone while still holding BTN_MIDDLE
+        // Pull mouse directly out of deadzone after just 16ms (well before 180ms hold_delay_ms!)
         sm.set_absolute_cursor(1000, 570, &cfg);
-        for step in 1..=6 {
+        let first_cmds = sm.tick(t0 + Duration::from_millis(16), &cfg, &mut emitter);
+        assert!(
+            first_cmds
+                .iter()
+                .any(|c| matches!(c, IndicatorCommand::Show { .. }))
+        );
+        assert!(sm.is_active());
+
+        for step in 2..=6 {
             let _ = sm.tick(t0 + Duration::from_millis(step * 16), &cfg, &mut emitter);
         }
         assert!(!emitter.events.is_empty());
@@ -1394,6 +1502,23 @@ mod tests {
     }
 
     #[test]
+    fn instant_tap_to_latch_works_when_short_click_passthrough_disabled() {
+        let mut sm = ScrollStateMachine::new();
+        let mut cfg = ConfigData::default();
+        cfg.short_click_passthrough = false;
+        let t0 = Instant::now();
+
+        let show = sm.on_middle_down(t0, &cfg, (2500, 600), (2500, 600), true, || None);
+        assert!(matches!(show, Some(IndicatorCommand::Show { .. })));
+        assert!(sm.is_active());
+        assert!(
+            sm.on_middle_up(t0 + Duration::from_millis(60), &cfg)
+                .is_none()
+        );
+        assert!(sm.is_active());
+    }
+
+    #[test]
     fn diagonal_2d_scrolling_respects_circular_deadzone_and_1d_blocks_horizontal() {
         let mut sm = ScrollStateMachine::new();
         let mut cfg = ConfigData::default();
@@ -1403,7 +1528,7 @@ mod tests {
         let t0 = Instant::now();
 
         let _ = sm.on_middle_down(t0, &cfg, (500, 500), (500, 500), true, || None);
-        // (9, 9) has hypot ~12.73 > 12 (outside circular deadzone), emits both axes
+        // Pulling diagonally outside circular deadzone activates immediately and emits both axes
         sm.set_absolute_cursor(550, 550, &cfg);
         for step in 1..=10 {
             let _ = sm.tick(t0 + Duration::from_millis(step * 16), &cfg, &mut emitter);
@@ -1472,36 +1597,36 @@ mod tests {
     fn physical_wheel_and_second_middle_click_stop_active_autoscroll() {
         let mut sm = ScrollStateMachine::new();
         let cfg = ConfigData::default();
+        let mut emitter = MockEmitter::default();
         let t0 = Instant::now();
 
-        let show = sm.on_middle_down(t0, &cfg, (400, 400), (400, 400), true, || None);
-        assert!(matches!(show, Some(IndicatorCommand::Show { .. })));
-        assert!(sm.on_middle_up(t0 + Duration::from_millis(70), &cfg).is_none());
+        let _ = sm.on_middle_down(t0, &cfg, (400, 400), (400, 400), true, || None);
+        let cmds = sm.tick(t0 + Duration::from_millis(180), &cfg, &mut emitter);
+        assert!(cmds.iter().any(|c| matches!(c, IndicatorCommand::Show { .. })));
+        assert!(
+            sm.on_middle_up(t0 + Duration::from_millis(220), &cfg)
+                .is_none()
+        );
         assert!(sm.is_active());
 
-        // Spinning physical wheel within grace window (< 150ms) is ignored
-        assert!(sm.on_physical_wheel(t0 + Duration::from_millis(100)).is_none());
+        // Spinning physical wheel within grace window (< 150ms after activation at t0+180ms) is ignored
+        assert!(sm.on_physical_wheel(t0 + Duration::from_millis(260)).is_none());
         assert!(sm.is_active());
 
         // Spinning physical wheel after grace window stops autoscroll
-        let hide_cmd = sm.on_physical_wheel(t0 + Duration::from_millis(300));
+        let hide_cmd = sm.on_physical_wheel(t0 + Duration::from_millis(400));
         assert_eq!(hide_cmd, Some(IndicatorCommand::Hide));
         assert!(sm.is_idle());
 
         // Reactivate and verify second middle click stops Einrast-Modus
-        let _ = sm.on_middle_down(
-            t0 + Duration::from_millis(400),
-            &cfg,
-            (400, 400),
-            (400, 400),
-            true,
-            || None,
-        );
-        let _ = sm.on_middle_up(t0 + Duration::from_millis(460), &cfg);
+        let t1 = t0 + Duration::from_millis(500);
+        let _ = sm.on_middle_down(t1, &cfg, (400, 400), (400, 400), true, || None);
+        let _ = sm.tick(t1 + Duration::from_millis(180), &cfg, &mut emitter);
+        let _ = sm.on_middle_up(t1 + Duration::from_millis(220), &cfg);
         assert!(sm.is_active());
         assert_eq!(
             sm.on_middle_down(
-                t0 + Duration::from_millis(600),
+                t1 + Duration::from_millis(320),
                 &cfg,
                 (400, 400),
                 (400, 400),
@@ -1520,16 +1645,17 @@ mod tests {
         let mut emitter = MockEmitter::default();
         let t0 = Instant::now();
 
-        // 1. Anchor starts, then active tab closes 90ms later before any scroll -> auto-cancels
+        // 1. Anchor activates after brief hold, then tab/title changes before any scroll -> auto-cancels
         let _ = sm.on_middle_down(t0, &cfg, (800, 300), (800, 300), true, || None);
-        let _ = sm.on_middle_up(t0 + Duration::from_millis(60), &cfg);
+        let _ = sm.tick(t0 + Duration::from_millis(180), &cfg, &mut emitter);
+        let _ = sm.on_middle_up(t0 + Duration::from_millis(210), &cfg);
         assert!(sm.is_active());
 
-        let cancel = sm.on_window_context_changed(t0 + Duration::from_millis(90), &cfg);
+        let cancel = sm.on_window_context_changed(t0 + Duration::from_millis(240), &cfg);
         assert_eq!(cancel, Some(IndicatorCommand::Hide));
         assert!(sm.is_idle());
 
-        // 2. Anchor starts and user actually scrolls -> subsequent page title updates do NOT cancel
+        // 2. Anchor starts via drag and user actually scrolls -> subsequent title updates do NOT cancel
         let _ = sm.on_middle_down(t0, &cfg, (800, 300), (800, 300), true, || None);
         sm.set_absolute_cursor(800, 360, &cfg);
         let _ = sm.tick(t0 + Duration::from_millis(20), &cfg, &mut emitter);
