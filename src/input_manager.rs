@@ -287,6 +287,9 @@ const HI_RES_PER_NOTCH: i32 = 120;
 const TOGGLE_CLICK_MAX_MS: u64 = 300;
 /// Ignore accidental physical wheel jitter immediately after BTN_MIDDLE press (wobbly wheel click).
 const WHEEL_CANCEL_GRACE_MS: u64 = 150;
+/// Maximum window in milliseconds after `BTN_MIDDLE` press during which an un-scrolled
+/// tab close / page navigation (`captionChanged` / `windowActivated`) auto-cancels the anchor.
+const CONTEXT_CHANGE_CANCEL_WINDOW_MS: u64 = 450;
 
 #[derive(Debug, Clone, PartialEq)]
 enum ScrollPhase {
@@ -312,6 +315,7 @@ enum ScrollPhase {
         delta_y: f32,
         button_held: bool,
         exited_deadzone_while_held: bool,
+        has_scrolled: bool,
         live_cursor_available: bool,
         using_absolute_cursor: bool,
         accum_hires_x: f32,
@@ -419,6 +423,7 @@ impl ScrollStateMachine {
             delta_y: 0.0,
             button_held: true,
             exited_deadzone_while_held: false,
+            has_scrolled: false,
             live_cursor_available,
             using_absolute_cursor: false,
             accum_hires_x: 0.0,
@@ -533,6 +538,7 @@ impl ScrollStateMachine {
                         delta_y: 0.0,
                         button_held: false,
                         exited_deadzone_while_held: false,
+                        has_scrolled: false,
                         live_cursor_available: live_ok,
                         using_absolute_cursor: false,
                         accum_hires_x: 0.0,
@@ -589,6 +595,40 @@ impl ScrollStateMachine {
     /// Handles clicking any other mouse button or pressing ESC.
     pub fn on_cancel_input(&mut self) -> Option<IndicatorCommand> {
         self.force_stop()
+    }
+
+    /// Auto-cancels an un-scrolled anchor if the window title/tab or active window changed
+    /// immediately after `BTN_MIDDLE` was pressed (e.g., closing an active tab or navigating).
+    pub fn on_window_context_changed(
+        &mut self,
+        now: Instant,
+        config: &ConfigData,
+    ) -> Option<IndicatorCommand> {
+        if !config.ignore_hyperlinks_and_tabs {
+            return None;
+        }
+        match &self.phase {
+            ScrollPhase::Idle => None,
+            ScrollPhase::Pending { .. } => {
+                self.phase = ScrollPhase::Idle;
+                None
+            }
+            ScrollPhase::Active {
+                started_at,
+                has_scrolled,
+                ..
+            } => {
+                if !*has_scrolled
+                    && now.saturating_duration_since(*started_at)
+                        <= Duration::from_millis(CONTEXT_CHANGE_CANCEL_WINDOW_MS)
+                {
+                    self.phase = ScrollPhase::Idle;
+                    Some(IndicatorCommand::Hide)
+                } else {
+                    None
+                }
+            }
+        }
     }
 
     /// Handles physical mouse wheel turns from hardware devices.
@@ -676,6 +716,7 @@ impl ScrollStateMachine {
                     delta_y: 0.0,
                     button_held: true,
                     exited_deadzone_while_held: false,
+                    has_scrolled: false,
                     live_cursor_available,
                     using_absolute_cursor: false,
                     accum_hires_x: 0.0,
@@ -699,6 +740,7 @@ impl ScrollStateMachine {
             last_tick_at,
             delta_x,
             delta_y,
+            has_scrolled,
             accum_hires_x,
             accum_hires_y,
             pending_std_hires_x,
@@ -727,6 +769,7 @@ impl ScrollStateMachine {
                 // True 2D circular deadzone + unit-vector directional decomposition
                 let dist = dx.hypot(dy);
                 if dist > deadzone {
+                    *has_scrolled = true;
                     let total_rate = calc_scroll_rate(dist - deadzone, speed_mult, curve_exp);
                     let ux = dx / dist;
                     let uy = dy / dist;
@@ -753,6 +796,7 @@ impl ScrollStateMachine {
                 *accum_hires_x = 0.0;
                 let abs_dy = dy.abs();
                 if abs_dy > deadzone {
+                    *has_scrolled = true;
                     let mut rate_y = calc_scroll_rate(abs_dy - deadzone, speed_mult, curve_exp);
                     if config.invert_vertical {
                         rate_y = -rate_y;
@@ -1114,6 +1158,7 @@ fn run_engine_loop(
                     } else {
                         let probe = window_tracker.probe_pointer_and_start_live_cursor();
                         if probe.is_dock_or_desktop
+                            || window_tracker.is_interactive_probe(&probe, &cfg)
                             || window_tracker.check_probe_excluded(&probe, &cfg).is_some()
                         {
                             window_tracker.stop_live_cursor();
@@ -1145,6 +1190,16 @@ fn run_engine_loop(
                 }
                 let _ = indicator_tx.send(c);
             }
+        }
+
+        if !state_machine.is_idle()
+            && window_tracker.take_window_context_changed()
+            && let Some(cmd) = state_machine.on_window_context_changed(Instant::now(), &cfg)
+        {
+            if matches!(cmd, IndicatorCommand::Hide) {
+                window_tracker.stop_live_cursor();
+            }
+            let _ = indicator_tx.send(cmd);
         }
 
         if state_machine.is_active()
@@ -1456,6 +1511,33 @@ mod tests {
             Some(IndicatorCommand::Hide)
         );
         assert!(sm.is_idle());
+    }
+
+    #[test]
+    fn auto_cancels_unscrolled_anchor_on_tab_close_or_title_change_but_preserves_active_scroll() {
+        let mut sm = ScrollStateMachine::new();
+        let cfg = ConfigData::default();
+        let mut emitter = MockEmitter::default();
+        let t0 = Instant::now();
+
+        // 1. Anchor starts, then active tab closes 90ms later before any scroll -> auto-cancels
+        let _ = sm.on_middle_down(t0, &cfg, (800, 300), (800, 300), true, || None);
+        let _ = sm.on_middle_up(t0 + Duration::from_millis(60), &cfg);
+        assert!(sm.is_active());
+
+        let cancel = sm.on_window_context_changed(t0 + Duration::from_millis(90), &cfg);
+        assert_eq!(cancel, Some(IndicatorCommand::Hide));
+        assert!(sm.is_idle());
+
+        // 2. Anchor starts and user actually scrolls -> subsequent page title updates do NOT cancel
+        let _ = sm.on_middle_down(t0, &cfg, (800, 300), (800, 300), true, || None);
+        sm.set_absolute_cursor(800, 360, &cfg);
+        let _ = sm.tick(t0 + Duration::from_millis(20), &cfg, &mut emitter);
+        assert!(
+            sm.on_window_context_changed(t0 + Duration::from_millis(100), &cfg)
+                .is_none()
+        );
+        assert!(sm.is_active());
     }
 
     #[test]
