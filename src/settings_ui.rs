@@ -126,7 +126,7 @@ fn apply_breeze_visuals(ctx: &egui::Context, palette: SettingsPalette) {
 fn build_app_icon() -> Option<egui::IconData> {
     let argb = render_tray_icon_argb32_be(true, 64);
     let mut rgba = Vec::with_capacity(argb.len());
-    for px in argb.chunks_exact(4) {
+    for px in argb.as_chunks::<4>().0 {
         rgba.extend_from_slice(&[px[1], px[2], px[3], px[0]]);
     }
     Some(egui::IconData {

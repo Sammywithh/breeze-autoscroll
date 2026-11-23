@@ -329,6 +329,8 @@ unsafe fn load_sym(handle: *mut libc::c_void, name: &CStr) -> Option<*mut libc::
     (!ptr.is_null()).then_some(ptr)
 }
 
+type CursorHotspotInfo = ((i32, i32), bool);
+
 struct X11Client {
     conn: RustConnection,
     root: Window,
@@ -338,9 +340,7 @@ struct X11Client {
 
 impl X11Client {
     fn connect() -> Option<Self> {
-        if env::var_os("DISPLAY").is_none() {
-            return None;
-        }
+        env::var_os("DISPLAY")?;
         let (conn, screen_num) = x11rb::connect(None).ok()?;
         let _ = conn
             .xfixes_query_version(5, 0)
@@ -372,7 +372,7 @@ impl X11Client {
         Ok(Some((reply.root_x as i32, reply.root_y as i32)))
     }
 
-    fn query_cursor_hotspot_and_interactive(&self) -> Result<Option<((i32, i32), bool)>, ()> {
+    fn query_cursor_hotspot_and_interactive(&self) -> Result<Option<CursorHotspotInfo>, ()> {
         let cookie = self
             .conn
             .xfixes_get_cursor_image_and_name()
@@ -1074,12 +1074,11 @@ pub fn is_interactive_window_chrome(
         }
     } else if probe.atspi_role.is_none()
         && probe.window.as_ref().is_some_and(is_file_manager_window)
-        && rel_y >= 0
-        && rel_y < FILE_MANAGER_TOP_CHROME_PX
+        && (0..FILE_MANAGER_TOP_CHROME_PX).contains(&rel_y)
     {
         // 3. Fallback toolbar + tab bar guard for file managers when AT-SPI2 is unavailable
         return true;
-    } else if probe.no_border && rel_y >= 0 && rel_y < CSD_HEADERBAR_HEIGHT_PX {
+    } else if probe.no_border && (0..CSD_HEADERBAR_HEIGHT_PX).contains(&rel_y) {
         // 4. Frameless CSD application window headerbar
         return true;
     }

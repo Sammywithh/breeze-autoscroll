@@ -370,9 +370,7 @@ struct X11OverlayWindow {
 
 impl X11OverlayWindow {
     fn new() -> Option<Self> {
-        if env::var_os("DISPLAY").is_none() {
-            return None;
-        }
+        env::var_os("DISPLAY")?;
         let (conn, screen_num) = x11rb::connect(None).ok()?;
         let screen = conn.setup().roots.get(screen_num)?.clone();
 

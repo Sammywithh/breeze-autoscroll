@@ -1185,10 +1185,9 @@ fn run_engine_loop(
                 }
                 if (pfd.revents & libc::POLLIN) != 0
                     && let Some(dev) = devices.get(idx)
+                    && !read_device_events(dev, &mut actions)
                 {
-                    if !read_device_events(dev, &mut actions) {
-                        needs_rescan = true;
-                    }
+                    needs_rescan = true;
                 }
             }
         }
@@ -1347,12 +1346,11 @@ fn read_device_events(dev: &EvdevDevice, out: &mut Vec<RawEvdevAction>) -> bool 
                     } else if ev.value == 0 {
                         out.push(RawEvdevAction::MiddleUp);
                     }
-                } else if dev.is_mouse
+                } else if (dev.is_mouse
                     && ev.value == 1
-                    && matches!(ev.code, BTN_LEFT | BTN_RIGHT | BTN_SIDE | BTN_EXTRA)
+                    && matches!(ev.code, BTN_LEFT | BTN_RIGHT | BTN_SIDE | BTN_EXTRA))
+                    || (dev.has_esc && ev.value == 1 && ev.code == KEY_ESC)
                 {
-                    out.push(RawEvdevAction::CancelInput);
-                } else if dev.has_esc && ev.value == 1 && ev.code == KEY_ESC {
                     out.push(RawEvdevAction::CancelInput);
                 }
             }
@@ -1504,8 +1502,10 @@ mod tests {
     #[test]
     fn instant_tap_to_latch_works_when_short_click_passthrough_disabled() {
         let mut sm = ScrollStateMachine::new();
-        let mut cfg = ConfigData::default();
-        cfg.short_click_passthrough = false;
+        let cfg = ConfigData {
+            short_click_passthrough: false,
+            ..Default::default()
+        };
         let t0 = Instant::now();
 
         let show = sm.on_middle_down(t0, &cfg, (2500, 600), (2500, 600), true, || None);
@@ -1521,9 +1521,11 @@ mod tests {
     #[test]
     fn diagonal_2d_scrolling_respects_circular_deadzone_and_1d_blocks_horizontal() {
         let mut sm = ScrollStateMachine::new();
-        let mut cfg = ConfigData::default();
-        cfg.deadzone = 12;
-        cfg.allow_horizontal = true;
+        let mut cfg = ConfigData {
+            deadzone: 12,
+            allow_horizontal: true,
+            ..Default::default()
+        };
         let mut emitter = MockEmitter::default();
         let t0 = Instant::now();
 
@@ -1574,8 +1576,10 @@ mod tests {
     #[test]
     fn optional_protect_3d_drag_aborts_immediate_movement_when_enabled() {
         let mut sm = ScrollStateMachine::new();
-        let mut cfg = ConfigData::default();
-        cfg.protect_3d_drag = true;
+        let cfg = ConfigData {
+            protect_3d_drag: true,
+            ..Default::default()
+        };
         let mut emitter = MockEmitter::default();
         let t0 = Instant::now();
 

@@ -371,6 +371,9 @@ impl AutoscrollControlIface {
 // org.kde.StatusNotifierItem Interface
 // ============================================================================
 
+type IconPixmap = (i32, i32, Vec<u8>);
+type ToolTip = (String, Vec<IconPixmap>, String, String);
+
 struct StatusNotifierItemIface {
     state: TraySharedState,
 }
@@ -447,7 +450,7 @@ impl StatusNotifierItemIface {
     }
 
     #[zbus(property, name = "ToolTip")]
-    fn tool_tip(&self) -> (String, Vec<(i32, i32, Vec<u8>)>, String, String) {
+    fn tool_tip(&self) -> ToolTip {
         let cfg = self.state.config.snapshot();
         let status = if cfg.enabled {
             "Aktiviert"
@@ -746,7 +749,7 @@ pub fn try_activate_existing_instance(open_settings: bool) -> bool {
 
 /// Notifies a running background daemon to reload `config.json` and refresh the tray icon.
 pub fn notify_daemon_reload_config() {
-    let _ = zbus::block_on(async {
+    zbus::block_on(async {
         let Ok(conn) = Connection::session().await else {
             return;
         };

@@ -481,8 +481,9 @@ async fn hit_test_tree(
         }
 
         // Also try SCREEN coordinates on the frame root if WINDOW coords returned null (GTK/X11)
-        if next_path.is_none() && curr_path == frame_path {
-            if let Some(candidate) = get_accessible_at_point(
+        if next_path.is_none()
+            && curr_path == frame_path
+            && let Some(candidate) = get_accessible_at_point(
                 conn,
                 bus_name,
                 &curr_path,
@@ -491,10 +492,9 @@ async fn hit_test_tree(
                 ATSPI_COORD_SCREEN,
             )
             .await
-                && candidate != curr_path
-            {
-                next_path = Some(candidate);
-            }
+            && candidate != curr_path
+        {
+            next_path = Some(candidate);
         }
 
         let Some(child_path) = next_path else {
