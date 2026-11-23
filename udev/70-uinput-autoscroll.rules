@@ -6,7 +6,7 @@
 # as a per-seat ACL for the active local desktop session).
 #
 # 1. Grant only the active local session access to /dev/uinput (root:root 0600 + uaccess ACL).
-KERNEL=="uinput", SUBSYSTEM=="misc", MODE="0600", TAG+="uaccess", OPTIONS+="static_node=uinput"
+KERNEL=="uinput", SUBSYSTEM=="misc", OWNER="root", GROUP="root", MODE="0660", TAG+="uaccess", OPTIONS+="static_node=uinput"
 
 # 2. Grant only the active local session access to pure mouse event devices.
 #    Keyboards (ID_INPUT_KEYBOARD=="1") are explicitly excluded to prevent
