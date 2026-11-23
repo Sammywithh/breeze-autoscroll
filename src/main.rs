@@ -32,7 +32,7 @@ extern "C" fn handle_quit_signal(_sig: libc::c_int) {
     SIGNAL_QUIT.store(true, Ordering::SeqCst);
     let fd = SIGNAL_WAKE_WRITE_FD.load(Ordering::Acquire);
     if fd >= 0 {
-        let byte = [b'Q'];
+        let byte = *b"Q";
         unsafe {
             let _ = libc::write(fd, byte.as_ptr().cast::<libc::c_void>(), 1);
         }
@@ -42,7 +42,7 @@ extern "C" fn handle_quit_signal(_sig: libc::c_int) {
 extern "C" fn handle_sigchld(_sig: libc::c_int) {
     let fd = SIGNAL_WAKE_WRITE_FD.load(Ordering::Acquire);
     if fd >= 0 {
-        let byte = [b'C'];
+        let byte = *b"C";
         unsafe {
             let _ = libc::write(fd, byte.as_ptr().cast::<libc::c_void>(), 1);
         }
@@ -245,7 +245,7 @@ fn run_daemon(open_settings: bool) -> ExitCode {
     };
 
     // Start single persistent KWin Wayland window & pointer bridge + opt-in AT-SPI2 inspector
-    window_tracker.start_kwin_bridge(config_mgr.clone());
+    window_tracker.start_kwin_bridge(config_mgr.clone(), Some(tray_service.kwin_verifier()));
 
     // Start translucent X11/XWayland Breeze indicator overlay thread (bounded channel + auto-reconnect)
     let (mut indicator_handle, indicator_tx) = IndicatorHandle::spawn();
@@ -423,7 +423,7 @@ mod tests {
         }
 
         // Write SIGCHLD marker ('C')
-        let c = [b'C'];
+        let c = *b"C";
         unsafe {
             assert_eq!(
                 libc::write(write_end.as_raw_fd(), c.as_ptr().cast::<libc::c_void>(), 1),

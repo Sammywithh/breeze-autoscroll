@@ -75,15 +75,15 @@ impl PidCache {
 
     fn insert(&mut self, pid: u32, bus_name: String, now: Instant) {
         self.purge_expired(now);
-        if !self.entries.contains_key(&pid) && self.entries.len() >= self.max_entries {
-            if let Some(oldest_pid) = self
+        if !self.entries.contains_key(&pid)
+            && self.entries.len() >= self.max_entries
+            && let Some(oldest_pid) = self
                 .entries
                 .iter()
                 .min_by_key(|(_, (_, ts))| *ts)
                 .map(|(&k, _)| k)
-            {
-                self.entries.remove(&oldest_pid);
-            }
+        {
+            self.entries.remove(&oldest_pid);
         }
         self.entries.insert(pid, (bus_name, now));
     }
@@ -365,13 +365,9 @@ impl WorkerState {
 
         let is_enabled = match get_a11y_enabled(sconn).await {
             Some(true) => true,
-            Some(false) if auto_enable => {
-                if set_a11y_enabled(sconn, true).await {
-                    self.enabled_by_us = true;
-                    true
-                } else {
-                    false
-                }
+            Some(false) if auto_enable && set_a11y_enabled(sconn, true).await => {
+                self.enabled_by_us = true;
+                true
             }
             _ => false,
         };

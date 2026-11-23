@@ -147,7 +147,12 @@ struct SettingsApp {
 impl SettingsApp {
     fn new(cc: &eframe::CreationContext<'_>, config_mgr: ConfigManager) -> Self {
         configure_fonts(&cc.egui_ctx);
-        let draft = config_mgr.snapshot();
+        let mut draft = config_mgr.snapshot();
+        // Reflect real system autostart state (systemd user unit or fallback .desktop)
+        // without unnecessarily writing back to disk on open.
+        if let Some(real_autostart) = crate::config::detect_system_autostart_enabled() {
+            draft.autostart = real_autostart;
+        }
         let excluded_csv = draft.excluded_as_csv();
         let palette = SettingsPalette::for_theme(&draft.theme);
         apply_breeze_visuals(&cc.egui_ctx, palette);
@@ -162,12 +167,13 @@ impl SettingsApp {
         }
     }
 
-    fn persist_draft(&mut self) {
+    fn persist_draft(&mut self, sync_autostart: bool) {
         self.draft.set_excluded_from_csv(&self.excluded_csv);
         let updated = self.draft.clone();
-        self.config_mgr.update(true, |cfg| {
-            *cfg = updated;
-        });
+        self.config_mgr
+            .update_with_autostart_sync(true, sync_autostart, |cfg| {
+                *cfg = updated;
+            });
         notify_daemon_reload_config();
     }
 }
@@ -203,6 +209,7 @@ impl eframe::App for SettingsApp {
         }
         let palette = SettingsPalette::for_theme(&self.draft.theme);
         let mut changed = false;
+        let mut autostart_changed = false;
 
         egui::CentralPanel::default()
             .frame(
@@ -245,12 +252,16 @@ impl eframe::App for SettingsApp {
                                 )
                                 .changed();
                             ui.add_space(2.0);
-                            changed |= ui
+                            if ui
                                 .checkbox(
                                     &mut self.draft.autostart,
                                     "Automatisch beim Anmelden starten (KDE Autostart)",
                                 )
-                                .changed();
+                                .changed()
+                            {
+                                changed = true;
+                                autostart_changed = true;
+                            }
                         });
 
                         ui.add_space(10.0);
@@ -593,7 +604,7 @@ impl eframe::App for SettingsApp {
             });
 
         if changed {
-            self.persist_draft();
+            self.persist_draft(autostart_changed);
         }
     }
 }

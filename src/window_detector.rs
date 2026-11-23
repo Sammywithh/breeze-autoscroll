@@ -8,7 +8,7 @@ use std::fs::{File, OpenOptions};
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
-use std::sync::mpsc::{self, SyncSender};
+use std::sync::mpsc::{self, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -17,16 +17,20 @@ use x11rb::connection::Connection as X11Connection;
 use x11rb::protocol::xfixes::ConnectionExt as _;
 use x11rb::protocol::xproto::{AtomEnum, ConnectionExt as _, Window};
 use x11rb::rust_connection::RustConnection;
+use zbus::fdo::DBusProxy;
 use zbus::{Connection, Proxy, connection};
 
 use crate::atspi_inspector::AtSpiInspector;
 use crate::config::{ConfigData, ConfigManager, write_file_atomic_secure};
+use crate::tray::{BoundedBackoff, KWinOwnerVerifier, next_or_closed};
 
+const KWIN_BUS_NAME: &str = "org.kde.KWin";
 const KWIN_TRACKER_SCRIPT_NAME: &str = "breeze_autoscroll_tracker";
 const KWIN_LEGACY_LIVE_SCRIPT_NAME: &str = "breeze_autoscroll_cursor_live";
 const KWIN_SHORTCUT_PROBE_START: &str = "breeze_autoscroll_probe_start";
 const KWIN_SHORTCUT_PROBE_STOP: &str = "breeze_autoscroll_probe_stop";
 const KWIN_BRIDGE_DBUS_TIMEOUT_MS: u64 = 500;
+const KWIN_LOAD_BACKOFF_MS: &[u64] = &[250, 500, 1_000, 2_000, 5_000];
 const BRIDGE_CHANNEL_CAPACITY: usize = 32;
 const PROBE_TIMEOUT_MS: u64 = 80;
 const MAX_DRM_SLICE_LEN: usize = 4096;
@@ -516,14 +520,39 @@ impl X11Client {
 enum BridgeCmd {
     EnsureTrackerInstalled,
     ReinstallTracker,
+    KWinOwnerChanged(Option<String>),
     StartLiveCursorAndProbe,
     StopLiveCursor,
     Shutdown,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KWinOwnerAction {
+    MarkAbsent,
+    KeepInstalled,
+    ReloadScript,
+}
+
+fn decide_kwin_owner_action(
+    tracker_installed: bool,
+    loaded_owner: Option<&str>,
+    new_owner: Option<&str>,
+) -> KWinOwnerAction {
+    let Some(owner) = new_owner.filter(|s| !s.is_empty()) else {
+        return KWinOwnerAction::MarkAbsent;
+    };
+    if tracker_installed && loaded_owner == Some(owner) {
+        KWinOwnerAction::KeepInstalled
+    } else {
+        KWinOwnerAction::ReloadScript
+    }
+}
+
 struct BridgeHandle {
     tx: SyncSender<BridgeCmd>,
     join: Option<JoinHandle<()>>,
+    watch_state: Arc<Mutex<(bool, Option<Connection>)>>,
+    watch_join: Option<JoinHandle<()>>,
 }
 
 /// Thread-safe active window, Wayland/X11 pointer probe, and live cursor position tracker.
@@ -553,8 +582,13 @@ impl WindowTracker {
         }
     }
 
-    /// Starts the persistent KWin D-Bus scripting bridge and opt-in AT-SPI2 inspector.
-    pub fn start_kwin_bridge(&self, config: ConfigManager) {
+    /// Starts the persistent KWin D-Bus scripting bridge, `NameOwnerChanged` watcher for
+    /// `org.kde.KWin`, and opt-in AT-SPI2 inspector.
+    pub(crate) fn start_kwin_bridge(
+        &self,
+        config: ConfigManager,
+        kwin_verifier: Option<KWinOwnerVerifier>,
+    ) {
         self.atspi.start(config);
 
         let Ok(mut guard) = self.bridge.lock() else {
@@ -565,13 +599,28 @@ impl WindowTracker {
         }
 
         let (tx, rx) = mpsc::sync_channel(BRIDGE_CHANNEL_CAPACITY);
+        let bridge_verifier = kwin_verifier.clone();
         let join = thread::Builder::new()
             .name("breeze-kwin-bridge".to_string())
-            .spawn(move || run_kwin_bridge_loop(rx))
+            .spawn(move || run_kwin_bridge_loop(rx, bridge_verifier))
+            .ok();
+
+        let watch_state: Arc<Mutex<(bool, Option<Connection>)>> =
+            Arc::new(Mutex::new((false, None)));
+        let watch_state_clone = Arc::clone(&watch_state);
+        let watch_tx = tx.clone();
+        let watch_join = thread::Builder::new()
+            .name("breeze-kwin-watch".to_string())
+            .spawn(move || run_kwin_owner_watcher(watch_tx, watch_state_clone, kwin_verifier))
             .ok();
 
         let _ = tx.try_send(BridgeCmd::EnsureTrackerInstalled);
-        *guard = Some(BridgeHandle { tx, join });
+        *guard = Some(BridgeHandle {
+            tx,
+            join,
+            watch_state,
+            watch_join,
+        });
     }
 
     /// Notifies the AT-SPI2 worker to re-read runtime configuration (e.g. `auto_enable_atspi`).
@@ -579,7 +628,7 @@ impl WindowTracker {
         self.atspi.sync_config();
     }
 
-    /// Unloads the persistent KWin script and shuts down the KWin bridge & AT-SPI2 worker threads.
+    /// Unloads the persistent KWin script and shuts down the KWin bridge, watcher & AT-SPI2 worker threads.
     pub fn stop_kwin_bridge(&self) {
         self.atspi.stop();
 
@@ -589,8 +638,21 @@ impl WindowTracker {
             None
         };
         if let Some(mut h) = handle {
+            let active_watch_conn = if let Ok(mut guard) = h.watch_state.lock() {
+                guard.0 = true;
+                guard.1.take()
+            } else {
+                None
+            };
+            if let Some(conn) = active_watch_conn {
+                let _ = zbus::block_on(conn.close());
+            }
+
             if h.tx.try_send(BridgeCmd::Shutdown).is_err() {
                 let _ = h.tx.send(BridgeCmd::Shutdown);
+            }
+            if let Some(j) = h.watch_join.take() {
+                let _ = j.join();
             }
             if let Some(j) = h.join.take() {
                 let _ = j.join();
@@ -1373,7 +1435,113 @@ fn query_x11_window_title<C: X11Connection>(conn: &C, win: Window) -> Option<Str
 // Persistent KWin D-Bus Scripting Bridge (Single Persistent Script + kglobalaccel)
 // ============================================================================
 
-fn run_kwin_bridge_loop(rx: mpsc::Receiver<BridgeCmd>) {
+fn run_kwin_owner_watcher(
+    tx: SyncSender<BridgeCmd>,
+    watch_state: Arc<Mutex<(bool, Option<Connection>)>>,
+    kwin_verifier: Option<KWinOwnerVerifier>,
+) {
+    zbus::block_on(async move {
+        if watch_state.lock().map(|g| g.0).unwrap_or(true) {
+            return;
+        }
+
+        let Ok(conn) = connection::Builder::session()
+            .method_timeout(Duration::from_millis(KWIN_BRIDGE_DBUS_TIMEOUT_MS))
+            .build()
+            .await
+        else {
+            return;
+        };
+
+        // Atomically re-check shutdown before publishing `conn` so a fast `stop_kwin_bridge()`
+        // during startup can never race or leave the watcher hanging.
+        let aborted = match watch_state.lock() {
+            Ok(mut guard) if !guard.0 => {
+                guard.1 = Some(conn.clone());
+                false
+            }
+            _ => true,
+        };
+        if aborted {
+            let _ = conn.close().await;
+            return;
+        }
+
+        let owner_stream = match DBusProxy::new(&conn).await {
+            Ok(dbus) => dbus
+                .receive_name_owner_changed_with_args(&[(0, KWIN_BUS_NAME)])
+                .await
+                .ok(),
+            Err(_) => None,
+        };
+
+        if let Some(mut stream) = owner_stream {
+            while !watch_state.lock().map(|g| g.0).unwrap_or(true) {
+                let Some(sig) = next_or_closed(&mut stream, &conn).await else {
+                    break;
+                };
+                if watch_state.lock().map(|g| g.0).unwrap_or(true) {
+                    break;
+                }
+                if let Ok(args) = sig.args() {
+                    if args.name().as_str() != KWIN_BUS_NAME {
+                        continue;
+                    }
+                    let new_owner = args
+                        .new_owner()
+                        .as_ref()
+                        .map(|u| u.to_string())
+                        .filter(|s| !s.is_empty());
+
+                    if let Some(ref verifier) = kwin_verifier {
+                        verifier.update_owner_from_signal(new_owner.clone());
+                    }
+                    let _ = tx.try_send(BridgeCmd::KWinOwnerChanged(new_owner));
+                }
+            }
+        }
+
+        if let Ok(mut guard) = watch_state.lock() {
+            guard.1 = None;
+        }
+    });
+}
+
+async fn query_kwin_unique_owner(conn: &Connection) -> Option<String> {
+    let dbus = DBusProxy::new(conn).await.ok()?;
+    let name = KWIN_BUS_NAME.try_into().ok()?;
+    dbus.get_name_owner(name)
+        .await
+        .ok()
+        .map(|u| u.to_string())
+        .filter(|s| !s.is_empty())
+}
+
+async fn try_install_tracker(
+    conn_slot: &mut Option<Connection>,
+    tracker_str: &str,
+    kwin_verifier: Option<&KWinOwnerVerifier>,
+    unload_legacy: bool,
+) -> Result<Option<String>, ()> {
+    if unload_legacy {
+        let _ = unload_script(conn_slot, KWIN_LEGACY_LIVE_SCRIPT_NAME).await;
+    }
+    ensure_loaded_and_run(conn_slot, tracker_str, KWIN_TRACKER_SCRIPT_NAME).await?;
+    let owner = if let Some(conn) = conn_slot.as_ref() {
+        query_kwin_unique_owner(conn).await
+    } else {
+        None
+    };
+    if let (Some(verifier), Some(owner_id)) = (kwin_verifier, owner.clone()) {
+        verifier.update_owner_from_signal(Some(owner_id));
+    }
+    Ok(owner)
+}
+
+fn run_kwin_bridge_loop(
+    rx: mpsc::Receiver<BridgeCmd>,
+    kwin_verifier: Option<KWinOwnerVerifier>,
+) {
     let tracker_path = match kwin_script_path("kwin_tracker.js") {
         Ok(p) => p,
         Err(err) => {
@@ -1381,7 +1549,9 @@ fn run_kwin_bridge_loop(rx: mpsc::Receiver<BridgeCmd>) {
             return;
         }
     };
-    if let Err(err) = write_file_atomic_secure(&tracker_path, KWIN_PERSISTENT_BRIDGE_JS.as_bytes(), true) {
+    if let Err(err) =
+        write_file_atomic_secure(&tracker_path, KWIN_PERSISTENT_BRIDGE_JS.as_bytes(), true)
+    {
         eprintln!("[WindowDetector] Konnte KWin-Skript nicht sicher schreiben: {err}");
         return;
     }
@@ -1391,33 +1561,178 @@ fn run_kwin_bridge_loop(rx: mpsc::Receiver<BridgeCmd>) {
     zbus::block_on(async move {
         let mut conn: Option<Connection> = None;
         let mut tracker_installed = false;
+        let mut kwin_known_absent = false;
+        let mut loaded_kwin_owner: Option<String> = None;
+        let mut retry_backoff = BoundedBackoff::new(KWIN_LOAD_BACKOFF_MS);
+        let mut next_retry_at: Option<Instant> = None;
 
-        while let Ok(cmd) = rx.recv() {
+        loop {
+            let next_cmd = if let Some(deadline) = next_retry_at {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                match rx.recv_timeout(remaining) {
+                    Ok(cmd) => Some(cmd),
+                    Err(RecvTimeoutError::Timeout) => {
+                        next_retry_at = None;
+                        if !tracker_installed && !kwin_known_absent {
+                            match try_install_tracker(
+                                &mut conn,
+                                &tracker_str,
+                                kwin_verifier.as_ref(),
+                                true,
+                            )
+                            .await
+                            {
+                                Ok(owner) => {
+                                    tracker_installed = true;
+                                    loaded_kwin_owner = owner;
+                                    retry_backoff.reset();
+                                }
+                                Err(()) => {
+                                    conn = None;
+                                    loaded_kwin_owner = None;
+                                    next_retry_at =
+                                        retry_backoff.next_delay().map(|d| Instant::now() + d);
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                    Err(RecvTimeoutError::Disconnected) => break,
+                }
+            } else {
+                match rx.recv() {
+                    Ok(cmd) => Some(cmd),
+                    Err(_) => break,
+                }
+            };
+
+            let Some(cmd) = next_cmd else {
+                continue;
+            };
+
             match cmd {
                 BridgeCmd::EnsureTrackerInstalled => {
-                    let _ = unload_script(&mut conn, KWIN_LEGACY_LIVE_SCRIPT_NAME).await;
-                    tracker_installed =
-                        ensure_loaded_and_run(&mut conn, &tracker_str, KWIN_TRACKER_SCRIPT_NAME)
-                            .await
-                            .is_ok();
+                    retry_backoff.reset();
+                    next_retry_at = None;
+                    match try_install_tracker(
+                        &mut conn,
+                        &tracker_str,
+                        kwin_verifier.as_ref(),
+                        true,
+                    )
+                    .await
+                    {
+                        Ok(owner) => {
+                            tracker_installed = true;
+                            kwin_known_absent = false;
+                            loaded_kwin_owner = owner;
+                        }
+                        Err(()) => {
+                            conn = None;
+                            tracker_installed = false;
+                            loaded_kwin_owner = None;
+                            next_retry_at =
+                                retry_backoff.next_delay().map(|d| Instant::now() + d);
+                        }
+                    }
                 }
                 BridgeCmd::ReinstallTracker => {
                     conn = None;
-                    let _ = unload_script(&mut conn, KWIN_LEGACY_LIVE_SCRIPT_NAME).await;
-                    tracker_installed =
-                        ensure_loaded_and_run(&mut conn, &tracker_str, KWIN_TRACKER_SCRIPT_NAME)
+                    tracker_installed = false;
+                    loaded_kwin_owner = None;
+                    retry_backoff.reset();
+                    next_retry_at = None;
+                    match try_install_tracker(
+                        &mut conn,
+                        &tracker_str,
+                        kwin_verifier.as_ref(),
+                        true,
+                    )
+                    .await
+                    {
+                        Ok(owner) => {
+                            tracker_installed = true;
+                            kwin_known_absent = false;
+                            loaded_kwin_owner = owner;
+                        }
+                        Err(()) => {
+                            conn = None;
+                            next_retry_at =
+                                retry_backoff.next_delay().map(|d| Instant::now() + d);
+                        }
+                    }
+                }
+                BridgeCmd::KWinOwnerChanged(new_owner) => {
+                    if let Some(ref verifier) = kwin_verifier {
+                        verifier.update_owner_from_signal(new_owner.clone());
+                    }
+                    match decide_kwin_owner_action(
+                        tracker_installed,
+                        loaded_kwin_owner.as_deref(),
+                        new_owner.as_deref(),
+                    ) {
+                        KWinOwnerAction::MarkAbsent => {
+                            tracker_installed = false;
+                            kwin_known_absent = true;
+                            loaded_kwin_owner = None;
+                            next_retry_at = None;
+                            conn = None;
+                        }
+                        KWinOwnerAction::KeepInstalled => {
+                            kwin_known_absent = false;
+                            next_retry_at = None;
+                            retry_backoff.reset();
+                        }
+                        KWinOwnerAction::ReloadScript => {
+                            kwin_known_absent = false;
+                            tracker_installed = false;
+                            loaded_kwin_owner = None;
+                            conn = None;
+                            retry_backoff.reset();
+                            next_retry_at = None;
+                            match try_install_tracker(
+                                &mut conn,
+                                &tracker_str,
+                                kwin_verifier.as_ref(),
+                                true,
+                            )
                             .await
-                            .is_ok();
+                            {
+                                Ok(owner) => {
+                                    tracker_installed = true;
+                                    loaded_kwin_owner = owner.or(new_owner);
+                                }
+                                Err(()) => {
+                                    conn = None;
+                                    next_retry_at =
+                                        retry_backoff.next_delay().map(|d| Instant::now() + d);
+                                }
+                            }
+                        }
+                    }
                 }
                 BridgeCmd::StartLiveCursorAndProbe => {
                     if !tracker_installed {
-                        tracker_installed = ensure_loaded_and_run(
+                        match try_install_tracker(
                             &mut conn,
                             &tracker_str,
-                            KWIN_TRACKER_SCRIPT_NAME,
+                            kwin_verifier.as_ref(),
+                            false,
                         )
                         .await
-                        .is_ok();
+                        {
+                            Ok(owner) => {
+                                tracker_installed = true;
+                                kwin_known_absent = false;
+                                loaded_kwin_owner = owner;
+                                next_retry_at = None;
+                                retry_backoff.reset();
+                            }
+                            Err(()) => {
+                                conn = None;
+                                loaded_kwin_owner = None;
+                            }
+                        }
                     }
                     if tracker_installed
                         && invoke_kwin_shortcut(&mut conn, KWIN_SHORTCUT_PROBE_START)
@@ -1425,30 +1740,49 @@ fn run_kwin_bridge_loop(rx: mpsc::Receiver<BridgeCmd>) {
                             .is_err()
                     {
                         conn = None;
-                        tracker_installed = ensure_loaded_and_run(
+                        match try_install_tracker(
                             &mut conn,
                             &tracker_str,
-                            KWIN_TRACKER_SCRIPT_NAME,
+                            kwin_verifier.as_ref(),
+                            false,
                         )
                         .await
-                        .is_ok();
-                        if tracker_installed {
-                            let _ =
-                                invoke_kwin_shortcut(&mut conn, KWIN_SHORTCUT_PROBE_START).await;
+                        {
+                            Ok(owner) => {
+                                tracker_installed = true;
+                                kwin_known_absent = false;
+                                loaded_kwin_owner = owner;
+                                let _ =
+                                    invoke_kwin_shortcut(&mut conn, KWIN_SHORTCUT_PROBE_START)
+                                        .await;
+                            }
+                            Err(()) => {
+                                tracker_installed = false;
+                                loaded_kwin_owner = None;
+                            }
                         }
                     }
                 }
                 BridgeCmd::StopLiveCursor => {
-                    if tracker_installed {
+                    if tracker_installed && !kwin_known_absent {
                         let _ = invoke_kwin_shortcut(&mut conn, KWIN_SHORTCUT_PROBE_STOP).await;
                     }
                 }
                 BridgeCmd::Shutdown => {
-                    if tracker_installed {
+                    if tracker_installed && !kwin_known_absent {
                         let _ = invoke_kwin_shortcut(&mut conn, KWIN_SHORTCUT_PROBE_STOP).await;
+                        // Unload with the 500ms-timeout D-Bus connection; do not stack extra
+                        // timeouts if KWin has already exited or stopped responding during logout.
+                        if unload_script(&mut conn, KWIN_TRACKER_SCRIPT_NAME)
+                            .await
+                            .is_ok()
+                        {
+                            let _ = unload_script(&mut conn, KWIN_LEGACY_LIVE_SCRIPT_NAME).await;
+                        }
                     }
-                    let _ = unload_script(&mut conn, KWIN_LEGACY_LIVE_SCRIPT_NAME).await;
-                    let _ = unload_script(&mut conn, KWIN_TRACKER_SCRIPT_NAME).await;
+                    if let Some(c) = conn.take() {
+                        let _ = c.close().await;
+                    }
                     break;
                 }
             }
@@ -1534,9 +1868,10 @@ async fn unload_script(conn_slot: &mut Option<Connection>, plugin_name: &str) ->
     )
     .await
     .map_err(|_| ())?;
-    let _ = scripting
+    scripting
         .call::<_, _, bool>("unloadScript", &(plugin_name))
-        .await;
+        .await
+        .map_err(|_| ())?;
     Ok(())
 }
 
@@ -2339,5 +2674,43 @@ mod tests {
         assert!(KWIN_PERSISTENT_BRIDGE_JS.contains("breeze_autoscroll_probe_stop"));
         assert!(KWIN_PERSISTENT_BRIDGE_JS.contains("cursorPosChanged.disconnect"));
         assert!(KWIN_PERSISTENT_BRIDGE_JS.contains("captionChanged.disconnect"));
+    }
+
+    #[test]
+    fn kwin_load_backoff_and_owner_change_decisions_handle_login_and_restarts() {
+        let mut backoff = BoundedBackoff::new(KWIN_LOAD_BACKOFF_MS);
+        let delays: Vec<u64> = std::iter::from_fn(|| backoff.next_delay())
+            .map(|d| d.as_millis() as u64)
+            .collect();
+        assert_eq!(delays, vec![250, 500, 1_000, 2_000, 5_000]);
+        assert!(backoff.is_exhausted());
+
+        // KWin exited (empty or None owner) -> mark absent
+        assert_eq!(
+            decide_kwin_owner_action(true, Some(":1.42"), None),
+            KWinOwnerAction::MarkAbsent
+        );
+        assert_eq!(
+            decide_kwin_owner_action(true, Some(":1.42"), Some("")),
+            KWinOwnerAction::MarkAbsent
+        );
+
+        // Same owner while already installed -> avoid redundant reload
+        assert_eq!(
+            decide_kwin_owner_action(true, Some(":1.42"), Some(":1.42")),
+            KWinOwnerAction::KeepInstalled
+        );
+
+        // New KWin owner after compositor restart -> reload persistent script
+        assert_eq!(
+            decide_kwin_owner_action(true, Some(":1.42"), Some(":1.99")),
+            KWinOwnerAction::ReloadScript
+        );
+
+        // Late KWin startup when script was not yet installed -> load script
+        assert_eq!(
+            decide_kwin_owner_action(false, None, Some(":1.15")),
+            KWinOwnerAction::ReloadScript
+        );
     }
 }

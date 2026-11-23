@@ -3,22 +3,22 @@
 # Deinstallation Script: Breeze Autoscroll for Kubuntu 26.04
 # ==============================================================================
 
-set -e
+set -euo pipefail
+
+CURRENT_UID="$(id -u)"
 
 echo "=== Deinstallation von Breeze Autoscroll ==="
 echo ""
 
-# 1. Stop and disable systemd service
-if systemctl --user is-active --quiet breeze-autoscroll 2>/dev/null; then
-    echo "Stoppe Hintergrunddienst..."
-    systemctl --user stop breeze-autoscroll 2>/dev/null || true
-    systemctl --user disable breeze-autoscroll 2>/dev/null || true
-fi
+# 1. Stop and disable systemd user service
+echo "Stoppe und deaktiviere Hintergrunddienst..."
+systemctl --user stop breeze-autoscroll.service 2>/dev/null || true
+systemctl --user disable breeze-autoscroll.service 2>/dev/null || true
 
-# 2. Kill running processes (Rust & legacy Python)
-pkill -x "breeze-autoscro" 2>/dev/null || true
-pkill -f "^([^[:space:]]*/)?breeze-autoscroll($| )" 2>/dev/null || true
-pkill -f "breeze-autoscroll/src/main.py" 2>/dev/null || true
+# 2. Kill running processes (Rust & legacy Python) for current user only
+pkill -u "${CURRENT_UID}" -x "breeze-autoscro" 2>/dev/null || true
+pkill -u "${CURRENT_UID}" -f "^([^[:space:]]*/)?breeze-autoscroll($| )" 2>/dev/null || true
+pkill -u "${CURRENT_UID}" -f "breeze-autoscroll/src/main.py" 2>/dev/null || true
 
 # 3. Remove installed files
 echo "Entferne installierte Dateien..."
@@ -26,6 +26,11 @@ rm -f "${HOME}/.local/bin/breeze-autoscroll"
 rm -f "${HOME}/.local/share/applications/breeze-autoscroll.desktop"
 rm -f "${HOME}/.config/autostart/breeze-autoscroll.desktop"
 rm -f "${HOME}/.config/systemd/user/breeze-autoscroll.service"
+if [ -n "${XDG_CONFIG_HOME:-}" ]; then
+    rm -f "${XDG_CONFIG_HOME}/autostart/breeze-autoscroll.desktop"
+    rm -f "${XDG_CONFIG_HOME}/systemd/user/breeze-autoscroll.service"
+fi
+systemctl --user daemon-reload 2>/dev/null || true
 rm -rf "${HOME}/.local/share/breeze-autoscroll"
 rm -rf "${HOME}/.cache/breeze-autoscroll"
 if [ -n "${XDG_RUNTIME_DIR:-}" ]; then

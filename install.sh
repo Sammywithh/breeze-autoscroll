@@ -3,13 +3,15 @@
 # Installation Script: Breeze Autoscroll (Rust) for Kubuntu 26.04 (KDE Plasma 6)
 # ==============================================================================
 
-set -e
+set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CURRENT_UID="$(id -u)"
 BIN_DIR="${HOME}/.local/bin"
 DESKTOP_DIR="${HOME}/.local/share/applications"
-AUTOSTART_DIR="${HOME}/.config/autostart"
-SYSTEMD_USER_DIR="${HOME}/.config/systemd/user"
+LEGACY_AUTOSTART_FILE="${HOME}/.config/autostart/breeze-autoscroll.desktop"
+XDG_AUTOSTART_FILE="${XDG_CONFIG_HOME:-${HOME}/.config}/autostart/breeze-autoscroll.desktop"
+SYSTEMD_USER_DIR="${XDG_CONFIG_HOME:-${HOME}/.config}/systemd/user"
 SHARE_DIR="${HOME}/.local/share/breeze-autoscroll"
 TARGET_BIN="${BIN_DIR}/breeze-autoscroll"
 
@@ -19,31 +21,27 @@ echo "============================================================"
 echo ""
 
 # 1. Ensure required directories exist
-mkdir -p "${BIN_DIR}" "${DESKTOP_DIR}" "${AUTOSTART_DIR}" "${SYSTEMD_USER_DIR}"
+mkdir -p "${BIN_DIR}" "${DESKTOP_DIR}" "${SYSTEMD_USER_DIR}"
 
-# 2. Build or locate native Rust binary
-echo "[1/5] Bereite natives Rust-Binary vor..."
-SOURCE_BIN=""
-if command -v cargo &>/dev/null && [ -f "${SCRIPT_DIR}/Cargo.toml" ]; then
-    echo "Kompiliere Release-Binary mit Cargo..."
-    (cd "${SCRIPT_DIR}" && cargo build --release --locked)
-    SOURCE_BIN="${SCRIPT_DIR}/target/release/breeze-autoscroll"
-    cp "${SOURCE_BIN}" "${SCRIPT_DIR}/breeze-autoscroll"
-    chmod +x "${SCRIPT_DIR}/breeze-autoscroll"
-elif [ -x "${SCRIPT_DIR}/breeze-autoscroll" ]; then
-    SOURCE_BIN="${SCRIPT_DIR}/breeze-autoscroll"
-    echo "✓ Verwende vorkompiliertes Binary: ${SOURCE_BIN}"
-else
-    echo "Fehler: Weder 'cargo' noch vorkompiliertes './breeze-autoscroll' gefunden." >&2
+# 2. Build native Rust binary deterministically from source
+echo "[1/5] Baue natives Rust-Binary deterministisch mit Cargo..."
+if ! command -v cargo &>/dev/null; then
+    echo "Fehler: 'cargo' (Rust Toolchain) wurde nicht gefunden. Bitte installiere Rust/Cargo für einen deterministischen Build." >&2
     exit 1
 fi
+if [ ! -f "${SCRIPT_DIR}/Cargo.toml" ]; then
+    echo "Fehler: '${SCRIPT_DIR}/Cargo.toml' nicht gefunden." >&2
+    exit 1
+fi
+(cd "${SCRIPT_DIR}" && cargo build --release --locked)
+SOURCE_BIN="${SCRIPT_DIR}/target/release/breeze-autoscroll"
 
-# 3. Stop any running instance (legacy Python or older Rust binary)
+# 3. Stop any running instance (legacy Python or older Rust binary) for current user only
 echo "[2/5] Stoppe eventuell laufende alte Prozesse..."
 systemctl --user stop breeze-autoscroll.service 2>/dev/null || true
-pkill -f "breeze-autoscroll/src/main.py" 2>/dev/null || true
-pkill -x "breeze-autoscro" 2>/dev/null || true
-pkill -f "^([^[:space:]]*/)?breeze-autoscroll($| )" 2>/dev/null || true
+pkill -u "${CURRENT_UID}" -f "breeze-autoscroll/src/main.py" 2>/dev/null || true
+pkill -u "${CURRENT_UID}" -x "breeze-autoscro" 2>/dev/null || true
+pkill -u "${CURRENT_UID}" -f "^([^[:space:]]*/)?breeze-autoscroll($| )" 2>/dev/null || true
 sleep 0.2
 rm -rf "${SHARE_DIR}"
 
@@ -51,15 +49,18 @@ rm -rf "${SHARE_DIR}"
 echo "[3/5] Installiere Binary nach ${TARGET_BIN}..."
 install -m 755 "${SOURCE_BIN}" "${TARGET_BIN}"
 
-# 4. Install Desktop Starter & Autostart
-echo "[4/5] Erstelle Anwendungs- und Autostart-Einträge..."
+# 4. Install Desktop Starter & Single-Autostart via systemd --user
+echo "[4/5] Erstelle Anwendungs-Starter und systemd-User-Autostart..."
 sed "s|^Exec=.*|Exec=${TARGET_BIN}|" "${SCRIPT_DIR}/breeze-autoscroll.desktop" > "${DESKTOP_DIR}/breeze-autoscroll.desktop"
-cp "${DESKTOP_DIR}/breeze-autoscroll.desktop" "${AUTOSTART_DIR}/breeze-autoscroll.desktop"
-chmod +x "${DESKTOP_DIR}/breeze-autoscroll.desktop"
+chmod 644 "${DESKTOP_DIR}/breeze-autoscroll.desktop"
 
-# Install Systemd User Service
-cp "${SCRIPT_DIR}/breeze-autoscroll.service" "${SYSTEMD_USER_DIR}/breeze-autoscroll.service"
+# Remove any legacy XDG autostart entry to guarantee single autostart via systemd --user
+rm -f "${LEGACY_AUTOSTART_FILE}" "${XDG_AUTOSTART_FILE}"
+
+# Install & enable Systemd User Service (ohne --now, um laufende Sitzung nicht zu stören)
+install -m 644 "${SCRIPT_DIR}/breeze-autoscroll.service" "${SYSTEMD_USER_DIR}/breeze-autoscroll.service"
 systemctl --user daemon-reload 2>/dev/null || true
+systemctl --user enable breeze-autoscroll.service 2>/dev/null || true
 
 # 5. Configure uinput & Mouse Permissions (udev uaccess - Least Privilege)
 echo "[5/5] Konfiguriere Least-Privilege Eingabeberechtigungen (udev uaccess)..."

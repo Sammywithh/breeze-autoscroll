@@ -1,13 +1,26 @@
 [Unit]
 Description=Breeze Autoscroll (Windows-style Middle Click Scroll for KDE Plasma 6)
-After=graphical-session.target
+After=graphical-session.target plasma-workspace.target
 PartOf=graphical-session.target
+StartLimitIntervalSec=30
+StartLimitBurst=5
 
 [Service]
 Type=simple
 ExecStart=%h/.local/bin/breeze-autoscroll
 Restart=on-failure
 RestartSec=3
+TimeoutStopSec=5
+# Hardening (kein PrivateTmp=yes, damit /tmp/.X11-unix für XWayland erreichbar bleibt)
+NoNewPrivileges=yes
+RestrictAddressFamilies=AF_UNIX
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+MemoryHigh=128M
+MemoryMax=512M
+TasksMax=96
+LimitNOFILE=512
 
 [Install]
 WantedBy=graphical-session.target

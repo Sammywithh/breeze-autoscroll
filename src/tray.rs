@@ -3,9 +3,13 @@
 
 use std::collections::HashMap;
 use std::env;
+use std::future::{Future, poll_fn};
+use std::pin::{Pin, pin};
 use std::process::{Child, Command};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
+use std::task::Poll;
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use zbus::fdo::DBusProxy;
@@ -22,6 +26,11 @@ pub const AUTOSCROLL_PATH: &str = "/Autoscroll";
 pub const SNI_PATH: &str = "/StatusNotifierItem";
 pub const MENU_PATH: &str = "/MenuBar";
 
+const SNI_WATCHER_BUS_NAME: &str = "org.kde.StatusNotifierWatcher";
+const SNI_WATCHER_PATH: &str = "/StatusNotifierWatcher";
+const SNI_REGISTER_BACKOFF_MS: &[u64] = &[250, 500, 1_000, 2_000, 5_000];
+const TRAY_DBUS_METHOD_TIMEOUT: Duration = Duration::from_secs(2);
+
 const KWIN_BUS_NAME: &str = "org.kde.KWin";
 const KWIN_OWNER_CACHE_TTL: Duration = Duration::from_secs(10);
 const KWIN_MISMATCH_REFRESH_COOLDOWN: Duration = Duration::from_millis(200);
@@ -34,6 +43,60 @@ const MAX_MENU_GROUP_IDS: usize = 64;
 const MAX_MENU_PROP_NAME_BYTES: usize = 64;
 
 pub type MenuItem = (i32, HashMap<String, OwnedVariant>, Vec<OwnedVariant>);
+
+/// Deterministic bounded backoff schedule for login/startup D-Bus retries.
+#[derive(Debug, Clone)]
+pub(crate) struct BoundedBackoff {
+    delays_ms: &'static [u64],
+    attempt: usize,
+}
+
+impl BoundedBackoff {
+    pub(crate) const fn new(delays_ms: &'static [u64]) -> Self {
+        Self {
+            delays_ms,
+            attempt: 0,
+        }
+    }
+
+    pub(crate) fn reset(&mut self) {
+        self.attempt = 0;
+    }
+
+    pub(crate) fn next_delay(&mut self) -> Option<Duration> {
+        let &ms = self.delays_ms.get(self.attempt)?;
+        self.attempt += 1;
+        Some(Duration::from_millis(ms))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_exhausted(&self) -> bool {
+        self.attempt >= self.delays_ms.len()
+    }
+}
+
+/// Polls the next item from a `zbus` signal stream, returning `None` immediately when `conn` closes.
+pub(crate) async fn next_or_closed<S>(stream: &mut S, conn: &Connection) -> Option<S::Item>
+where
+    S: zbus::export::futures_core::Stream + Unpin,
+{
+    let mut closed = pin!(conn.closed());
+    poll_fn(|cx| {
+        if closed.as_mut().poll(cx).is_ready() {
+            return Poll::Ready(None);
+        }
+        Pin::new(&mut *stream).poll_next(cx)
+    })
+    .await
+}
+
+fn should_reregister_for_owner_change(
+    bus_name: &str,
+    expected_name: &str,
+    new_owner: Option<&str>,
+) -> bool {
+    bus_name == expected_name && new_owner.is_some_and(|o| !o.is_empty())
+}
 
 fn clamp_dbus_str(s: String, max_bytes: usize) -> String {
     if s.len() <= max_bytes {
@@ -62,7 +125,7 @@ impl QuitNotifier {
         self.requested.store(true, Ordering::SeqCst);
         let fd = self.wake_write_fd.load(Ordering::Acquire);
         if fd >= 0 {
-            let byte = [b'Q'];
+            let byte = *b"Q";
             unsafe {
                 let _ = libc::write(fd, byte.as_ptr().cast::<libc::c_void>(), 1);
             }
@@ -86,8 +149,14 @@ struct KWinOwnerCache {
 
 impl KWinOwnerCache {
     fn seed(&mut self, owner: Option<String>, now: Instant) {
-        self.owner = owner;
+        self.owner = owner.filter(|s| !s.is_empty());
         self.refreshed_at = Some(now);
+    }
+
+    fn set_owner_from_signal(&mut self, new_owner: Option<String>, now: Instant) {
+        self.owner = new_owner.filter(|s| !s.is_empty());
+        self.refreshed_at = Some(now);
+        self.last_mismatch_refresh = None;
     }
 
     fn check(&self, sender: &str, now: Instant) -> VerifyDecision {
@@ -125,13 +194,20 @@ impl KWinOwnerCache {
 /// Verifies that incoming KWin callback D-Bus messages genuinely originate from the
 /// current unique-name owner of `org.kde.KWin`.
 #[derive(Clone, Default)]
-struct KWinOwnerVerifier {
+pub(crate) struct KWinOwnerVerifier {
     cache: Arc<Mutex<KWinOwnerCache>>,
 }
 
 impl KWinOwnerVerifier {
     fn new() -> Self {
         Self::default()
+    }
+
+    /// Updates or invalidates the cached `org.kde.KWin` unique owner from a `NameOwnerChanged` signal.
+    pub(crate) fn update_owner_from_signal(&self, new_owner: Option<String>) {
+        if let Ok(mut guard) = self.cache.lock() {
+            guard.set_owner_from_signal(new_owner, Instant::now());
+        }
     }
 
     async fn query_owner(conn: &Connection) -> Option<String> {
@@ -393,11 +469,19 @@ impl TraySharedState {
 
 /// Handle to the running session D-Bus & KDE System Tray service.
 pub struct TrayService {
-    _conn: Connection,
+    conn: Option<Connection>,
+    shutdown: Arc<(Mutex<bool>, Condvar)>,
+    watcher_join: Option<JoinHandle<()>>,
     state: TraySharedState,
 }
 
 impl TrayService {
+    /// Returns a handle to the shared `KWinOwnerVerifier` so the KWin bridge can
+    /// invalidate or update the cached `org.kde.KWin` owner on compositor restarts.
+    pub(crate) fn kwin_verifier(&self) -> KWinOwnerVerifier {
+        self.state.kwin_verifier.clone()
+    }
+
     /// Opens (or focuses if already running) the tracked `--settings-window` child process.
     pub fn open_settings(&self) {
         self.state.open_settings();
@@ -406,6 +490,22 @@ impl TrayService {
     /// Reaps any exited `--settings-window` or `--about` child processes so no zombies remain.
     pub fn reap_exited_children(&self) {
         self.state.reap_exited_children();
+    }
+}
+
+impl Drop for TrayService {
+    fn drop(&mut self) {
+        let (lock, cvar) = &*self.shutdown;
+        if let Ok(mut stopped) = lock.lock() {
+            *stopped = true;
+            cvar.notify_all();
+        }
+        if let Some(conn) = self.conn.take() {
+            let _ = zbus::block_on(conn.close());
+        }
+        if let Some(join) = self.watcher_join.take() {
+            let _ = join.join();
+        }
     }
 }
 
@@ -1078,8 +1178,103 @@ pub fn notify_daemon_reload_config() {
     });
 }
 
+fn is_shutdown(shutdown: &(Mutex<bool>, Condvar)) -> bool {
+    shutdown.0.lock().map(|g| *g).unwrap_or(true)
+}
+
+/// Waits up to `delay`, returning `true` immediately if shutdown was requested.
+fn wait_cancellable(shutdown: &(Mutex<bool>, Condvar), delay: Duration) -> bool {
+    let (lock, cvar) = shutdown;
+    let Ok(mut guard) = lock.lock() else {
+        return true;
+    };
+    let deadline = Instant::now() + delay;
+    while !*guard {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return false;
+        }
+        match cvar.wait_timeout(guard, remaining) {
+            Ok((next_guard, _)) => guard = next_guard,
+            Err(_) => return true,
+        }
+    }
+    true
+}
+
+async fn register_status_notifier_item(conn: &Connection) -> Result<(), ()> {
+    let watcher = Proxy::new(
+        conn,
+        SNI_WATCHER_BUS_NAME,
+        SNI_WATCHER_PATH,
+        SNI_WATCHER_BUS_NAME,
+    )
+    .await
+    .map_err(|_| ())?;
+    watcher
+        .call::<_, _, ()>("RegisterStatusNotifierItem", &(SERVICE_NAME))
+        .await
+        .map_err(|_| ())
+}
+
+async fn register_sni_with_backoff(conn: &Connection, shutdown: &(Mutex<bool>, Condvar)) -> bool {
+    let mut backoff = BoundedBackoff::new(SNI_REGISTER_BACKOFF_MS);
+    loop {
+        if is_shutdown(shutdown) {
+            return false;
+        }
+        if register_status_notifier_item(conn).await.is_ok() {
+            return true;
+        }
+        let Some(delay) = backoff.next_delay() else {
+            return false;
+        };
+        if wait_cancellable(shutdown, delay) {
+            return false;
+        }
+    }
+}
+
+fn run_sni_watcher_task(conn: Connection, shutdown: Arc<(Mutex<bool>, Condvar)>) {
+    zbus::block_on(async move {
+        // Subscribe to NameOwnerChanged BEFORE initial registration so a plasmashell startup
+        // racing our first attempt cannot be missed.
+        let mut owner_stream = match DBusProxy::new(&conn).await {
+            Ok(dbus) => dbus
+                .receive_name_owner_changed_with_args(&[(0, SNI_WATCHER_BUS_NAME)])
+                .await
+                .ok(),
+            Err(_) => None,
+        };
+
+        let _ = register_sni_with_backoff(&conn, &shutdown).await;
+
+        let Some(ref mut stream) = owner_stream else {
+            return;
+        };
+
+        while !is_shutdown(&shutdown) {
+            let Some(sig) = next_or_closed(stream, &conn).await else {
+                break;
+            };
+            if is_shutdown(&shutdown) {
+                break;
+            }
+            if let Ok(args) = sig.args() {
+                let bus_name = args.name().as_str();
+                let new_owner = args.new_owner().as_ref().map(|u| u.as_str());
+                if should_reregister_for_owner_change(bus_name, SNI_WATCHER_BUS_NAME, new_owner) {
+                    let _ = register_sni_with_backoff(&conn, &shutdown).await;
+                }
+            }
+        }
+    });
+}
+
 /// Starts the session D-Bus service (`org.breeze.Autoscroll`, `StatusNotifierItem`, `dbusmenu`),
-/// pre-warms `KWinOwnerVerifier`, and registers with KDE Plasma's `StatusNotifierWatcher`.
+/// pre-warms `KWinOwnerVerifier`, and launches a non-blocking watcher task on the existing `zbus`
+/// connection to register with `org.kde.StatusNotifierWatcher` using bounded backoff retries and
+/// automatic re-registration across `plasmashell` restarts.
 pub fn start_tray_and_dbus_service(
     config: ConfigManager,
     window_tracker: WindowTracker,
@@ -1112,6 +1307,7 @@ pub fn start_tray_and_dbus_service(
         };
 
         let builder = connection::Builder::session()
+            .method_timeout(TRAY_DBUS_METHOD_TIMEOUT)
             .name(SERVICE_NAME)
             .serve_at(AUTOSCROLL_PATH, control)
             .serve_at(SNI_PATH, sni)
@@ -1120,29 +1316,24 @@ pub fn start_tray_and_dbus_service(
         #[cfg(feature = "debug-dbus")]
         let builder = builder.serve_at(AUTOSCROLL_PATH, AutoscrollDebugIface { state: shared });
 
-        let conn = builder
+        builder
             .build()
             .await
-            .map_err(|e| format!("D-Bus Session-Verbindung fehlgeschlagen: {e}"))?;
-
-        if let Ok(watcher) = Proxy::new(
-            &conn,
-            "org.kde.StatusNotifierWatcher",
-            "/StatusNotifierWatcher",
-            "org.kde.StatusNotifierWatcher",
-        )
-        .await
-        {
-            let _ = watcher
-                .call::<_, _, ()>("RegisterStatusNotifierItem", &(SERVICE_NAME))
-                .await;
-        }
-
-        Ok::<Connection, String>(conn)
+            .map_err(|e| format!("D-Bus Session-Verbindung fehlgeschlagen: {e}"))
     })?;
 
+    let shutdown = Arc::new((Mutex::new(false), Condvar::new()));
+    let watcher_conn = conn.clone();
+    let watcher_shutdown = Arc::clone(&shutdown);
+    let watcher_join = thread::Builder::new()
+        .name("breeze-sni-watcher".to_string())
+        .spawn(move || run_sni_watcher_task(watcher_conn, watcher_shutdown))
+        .ok();
+
     Ok(TrayService {
-        _conn: conn,
+        conn: Some(conn),
+        shutdown,
+        watcher_join,
         state: shared_for_handle,
     })
 }
@@ -1285,5 +1476,69 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert!(slot.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn bounded_backoff_yields_expected_schedule_exhausts_and_resets() {
+        let mut backoff = BoundedBackoff::new(SNI_REGISTER_BACKOFF_MS);
+        let collected: Vec<u64> = std::iter::from_fn(|| backoff.next_delay())
+            .map(|d| d.as_millis() as u64)
+            .collect();
+        assert_eq!(collected, vec![250, 500, 1_000, 2_000, 5_000]);
+        assert!(backoff.is_exhausted());
+        assert_eq!(backoff.next_delay(), None);
+
+        backoff.reset();
+        assert!(!backoff.is_exhausted());
+        assert_eq!(backoff.next_delay(), Some(Duration::from_millis(250)));
+    }
+
+    #[test]
+    fn should_reregister_only_for_matching_bus_name_with_non_empty_owner() {
+        assert!(should_reregister_for_owner_change(
+            SNI_WATCHER_BUS_NAME,
+            SNI_WATCHER_BUS_NAME,
+            Some(":1.77"),
+        ));
+        assert!(!should_reregister_for_owner_change(
+            SNI_WATCHER_BUS_NAME,
+            SNI_WATCHER_BUS_NAME,
+            Some(""),
+        ));
+        assert!(!should_reregister_for_owner_change(
+            SNI_WATCHER_BUS_NAME,
+            SNI_WATCHER_BUS_NAME,
+            None,
+        ));
+        assert!(!should_reregister_for_owner_change(
+            "org.kde.OtherService",
+            SNI_WATCHER_BUS_NAME,
+            Some(":1.77"),
+        ));
+    }
+
+    #[test]
+    fn kwin_owner_cache_signal_invalidates_and_updates_without_stale_cooldown() {
+        let mut cache = KWinOwnerCache::default();
+        let t0 = Instant::now();
+
+        cache.seed(Some(":1.42".to_string()), t0);
+        assert!(!cache.update_and_verify(Some(":1.42".to_string()), ":1.99", t0));
+        // Cooldown active for mismatch
+        assert_eq!(
+            cache.check(":1.99", t0 + Duration::from_millis(10)),
+            VerifyDecision::Deny
+        );
+
+        // KWin exits -> NameOwnerChanged with empty owner invalidates cache & clears cooldown
+        let t1 = t0 + Duration::from_millis(20);
+        cache.set_owner_from_signal(None, t1);
+        assert_eq!(cache.check(":1.42", t1), VerifyDecision::RefreshNeeded);
+
+        // KWin restarts with new unique name -> immediate zero-lookup Allow
+        let t2 = t0 + Duration::from_millis(30);
+        cache.set_owner_from_signal(Some(":1.120".to_string()), t2);
+        assert_eq!(cache.check(":1.120", t2), VerifyDecision::Allow);
+        assert_eq!(cache.check(":1.42", t2), VerifyDecision::RefreshNeeded);
     }
 }

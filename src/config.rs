@@ -5,15 +5,19 @@
 //! atomic secure persistence (`0600` / `O_NOFOLLOW`), and lock-free snapshot sharing (`Arc`).
 
 use std::env;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs::{self, DirBuilder, OpenOptions, Permissions};
 use std::io::{self, Write};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use serde::{Deserialize, Serialize};
+
+/// Systemd user service name used as the primary single-autostart mechanism.
+pub const SYSTEMD_USER_UNIT_NAME: &str = "breeze-autoscroll.service";
 
 /// Current configuration schema version.
 /// Version 2 switches default interaction to authentic Windows autoscroll
@@ -335,6 +339,7 @@ impl ConfigData {
 pub struct ConfigManager {
     config_file: PathBuf,
     data: Arc<RwLock<Arc<ConfigData>>>,
+    sync_autostart_on_save: bool,
 }
 
 impl ConfigManager {
@@ -342,6 +347,7 @@ impl ConfigManager {
     /// `$HOME/.config/breeze-autoscroll` (or a custom directory). Fails closed if neither
     /// `XDG_CONFIG_HOME` nor `HOME` is set and `config_dir` is `None`.
     pub fn try_new(config_dir: Option<PathBuf>) -> Result<Self, String> {
+        let sync_autostart_on_save = config_dir.is_none();
         let dir = match config_dir {
             Some(d) => d,
             None => default_config_dir()?,
@@ -350,6 +356,7 @@ impl ConfigManager {
         let manager = Self {
             config_file: file,
             data: Arc::new(RwLock::new(Arc::new(ConfigData::default()))),
+            sync_autostart_on_save,
         };
         manager.load();
         Ok(manager)
@@ -417,24 +424,42 @@ impl ConfigManager {
         }
     }
 
-    /// Updates configuration via closure, normalizes, optionally saves, and syncs KDE autostart.
+    /// Updates configuration via closure, normalizes, optionally saves, and syncs autostart
+    /// only when the `autostart` setting changed.
     pub fn update<F>(&self, save_to_disk: bool, f: F)
     where
         F: FnOnce(&mut ConfigData),
     {
-        let autostart = if let Ok(mut guard) = self.data.write() {
+        self.update_with_autostart_sync(save_to_disk, false, f);
+    }
+
+    /// Updates configuration via closure, normalizes, optionally saves, and syncs autostart when
+    /// `autostart` changed or `force_sync_autostart` is set.
+    pub fn update_with_autostart_sync<F>(
+        &self,
+        save_to_disk: bool,
+        force_sync_autostart: bool,
+        f: F,
+    ) where
+        F: FnOnce(&mut ConfigData),
+    {
+        let (prev_autostart, autostart) = if let Ok(mut guard) = self.data.write() {
+            let prev = guard.autostart;
             let mut next = (**guard).clone();
             f(&mut next);
             next.normalize();
             let auto = next.autostart;
             *guard = Arc::new(next);
-            auto
+            (prev, auto)
         } else {
             return;
         };
         if save_to_disk {
             self.save();
-            sync_kde_autostart(autostart);
+            if self.sync_autostart_on_save && (force_sync_autostart || prev_autostart != autostart)
+            {
+                sync_kde_autostart(autostart);
+            }
         }
     }
 
@@ -444,7 +469,9 @@ impl ConfigManager {
             *guard = Arc::new(ConfigData::default());
         }
         self.save();
-        sync_kde_autostart(true);
+        if self.sync_autostart_on_save {
+            sync_kde_autostart(true);
+        }
     }
 
     /// Returns the path to `config.json`.
@@ -633,49 +660,258 @@ pub(crate) fn write_file_atomic_secure(
     Ok(())
 }
 
-/// Synchronizes `$XDG_CONFIG_HOME/autostart/breeze-autoscroll.desktop` (or `~/.config/autostart/...`)
-/// with the `autostart` toggle without modifying shared XDG directory permissions.
-pub fn sync_kde_autostart(enabled: bool) {
-    let autostart_dir = if let Some(xdg) = env::var_os("XDG_CONFIG_HOME")
-        && !xdg.is_empty()
-        && Path::new(&xdg).is_absolute()
-    {
-        PathBuf::from(xdg).join("autostart")
-    } else if let Some(home) = env::var_os("HOME")
-        && !home.is_empty()
-        && Path::new(&home).is_absolute()
-    {
-        PathBuf::from(home).join(".config/autostart")
-    } else {
-        return;
-    };
-    let desktop_file = autostart_dir.join("breeze-autoscroll.desktop");
+/// Active single-autostart backend: `systemd --user` when the unit is installed, otherwise
+/// XDG autostart `.desktop` fallback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AutostartBackend {
+    SystemdUser,
+    XdgAutostartDesktop,
+}
 
-    if enabled {
-        let exec_path = env::current_exe()
-            .ok()
-            .and_then(|p| p.to_str().map(str::to_string))
-            .unwrap_or_else(|| "breeze-autoscroll".to_string());
-        let content = format!(
-            "#!/usr/bin/env xdg-open\n\
-             [Desktop Entry]\n\
-             Name=Breeze Autoscroll\n\
-             GenericName=Mausrad-Klick Autoscroll\n\
-             Comment=Windows-Mittelklick Autoscroll im Kubuntu 26.04 Breeze-Stil\n\
-             Exec={exec_path}\n\
-             Icon=preferences-desktop-mouse\n\
-             Terminal=false\n\
-             Type=Application\n\
-             Categories=Utility;Settings;Qt;KDE;\n\
-             StartupNotify=false\n\
-             X-KDE-autostart-phase=2\n\
-             X-GNOME-Autostart-enabled=true\n"
-        );
-        let _ = write_file_atomic_secure(&desktop_file, content.as_bytes(), false);
-    } else if let Ok(meta) = fs::symlink_metadata(&desktop_file)
-        && !meta.file_type().is_symlink()
+fn systemd_user_unit_candidates_from(
+    xdg_config_home: Option<&OsStr>,
+    home: Option<&OsStr>,
+) -> Vec<PathBuf> {
+    let mut candidates = Vec::with_capacity(4);
+    if let Some(xdg) = xdg_config_home
+        && !xdg.is_empty()
     {
-        let _ = fs::remove_file(&desktop_file);
+        let p = PathBuf::from(xdg);
+        if p.is_absolute() {
+            candidates.push(p.join("systemd/user").join(SYSTEMD_USER_UNIT_NAME));
+        }
+    }
+    if let Some(h) = home
+        && !h.is_empty()
+    {
+        let p = PathBuf::from(h);
+        if p.is_absolute() {
+            let home_unit = p.join(".config/systemd/user").join(SYSTEMD_USER_UNIT_NAME);
+            if !candidates.contains(&home_unit) {
+                candidates.push(home_unit);
+            }
+        }
+    }
+    candidates.push(PathBuf::from("/etc/systemd/user").join(SYSTEMD_USER_UNIT_NAME));
+    candidates.push(PathBuf::from("/usr/lib/systemd/user").join(SYSTEMD_USER_UNIT_NAME));
+    candidates
+}
+
+fn detect_autostart_backend_in(unit_candidates: &[PathBuf]) -> AutostartBackend {
+    if unit_candidates
+        .iter()
+        .any(|p| fs::metadata(p).is_ok_and(|m| m.is_file()))
+    {
+        AutostartBackend::SystemdUser
+    } else {
+        AutostartBackend::XdgAutostartDesktop
+    }
+}
+
+/// Detects whether `breeze-autoscroll.service` exists as a systemd user unit.
+pub fn detect_autostart_backend() -> AutostartBackend {
+    let xdg = env::var_os("XDG_CONFIG_HOME");
+    let home = env::var_os("HOME");
+    let candidates = systemd_user_unit_candidates_from(xdg.as_deref(), home.as_deref());
+    detect_autostart_backend_in(&candidates)
+}
+
+fn autostart_desktop_paths_from(
+    xdg_config_home: Option<&OsStr>,
+    home: Option<&OsStr>,
+) -> Vec<PathBuf> {
+    let mut paths = Vec::with_capacity(2);
+    if let Some(xdg) = xdg_config_home
+        && !xdg.is_empty()
+    {
+        let p = PathBuf::from(xdg);
+        if p.is_absolute() {
+            paths.push(p.join("autostart/breeze-autoscroll.desktop"));
+        }
+    }
+    if let Some(h) = home
+        && !h.is_empty()
+    {
+        let p = PathBuf::from(h);
+        if p.is_absolute() {
+            let legacy = p.join(".config/autostart/breeze-autoscroll.desktop");
+            if !paths.contains(&legacy) {
+                paths.push(legacy);
+            }
+        }
+    }
+    paths
+}
+
+fn remove_regular_file_no_symlink(path: &Path) {
+    if let Ok(meta) = fs::symlink_metadata(path)
+        && !meta.file_type().is_symlink()
+        && meta.is_file()
+    {
+        let _ = fs::remove_file(path);
+    }
+}
+
+/// Quotes and escapes an executable path argument for a Freedesktop Desktop Entry `Exec` key.
+///
+/// Follows the Desktop Entry Specification:
+/// - Rejects control characters (`\n`, `\r`, `\0`) to prevent key injection.
+/// - Escapes `%` as `%%` so literal percent signs are not interpreted as field codes.
+/// - Encloses arguments containing reserved characters in `"..."` and applies both Desktop Entry
+///   string escaping and `Exec` quoting (`\` -> `\\\\`, `"` -> `\\"`, `$` -> `\\$`, `` ` `` -> `` \\` ``).
+pub(crate) fn escape_desktop_exec_arg(arg: &str) -> Result<String, &'static str> {
+    if arg.bytes().any(|b| b == b'\n' || b == b'\r' || b == 0) {
+        return Err("Exec-Pfad enthält unzulässige Steuerzeichen");
+    }
+
+    let needs_quoting = arg.is_empty()
+        || arg.chars().any(|c| {
+            matches!(
+                c,
+                ' ' | '\t'
+                    | '"'
+                    | '\''
+                    | '\\'
+                    | '>'
+                    | '<'
+                    | '~'
+                    | '|'
+                    | '&'
+                    | ';'
+                    | '$'
+                    | '*'
+                    | '?'
+                    | '#'
+                    | '('
+                    | ')'
+                    | '`'
+            )
+        });
+
+    if !needs_quoting {
+        return Ok(arg.replace('%', "%%"));
+    }
+
+    let mut out = String::with_capacity(arg.len() + 8);
+    out.push('"');
+    for ch in arg.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\\\\\"),
+            '"' => out.push_str("\\\\\""),
+            '$' => out.push_str("\\\\$"),
+            '`' => out.push_str("\\\\`"),
+            '\t' => out.push_str("\\t"),
+            '%' => out.push_str("%%"),
+            other => out.push(other),
+        }
+    }
+    out.push('"');
+    Ok(out)
+}
+
+fn format_desktop_exec_path(path: &str) -> String {
+    escape_desktop_exec_arg(path).unwrap_or_else(|_| "breeze-autoscroll".to_string())
+}
+
+fn render_autostart_desktop_entry(exec_path: &str) -> String {
+    let escaped_exec = format_desktop_exec_path(exec_path);
+    format!(
+        "[Desktop Entry]\n\
+         Name=Breeze Autoscroll\n\
+         GenericName=Mausrad-Klick Autoscroll\n\
+         Comment=Windows-Mittelklick Autoscroll im Kubuntu 26.04 Breeze-Stil\n\
+         Exec={escaped_exec}\n\
+         Icon=preferences-desktop-mouse\n\
+         Terminal=false\n\
+         Type=Application\n\
+         Categories=Utility;Settings;Qt;KDE;\n\
+         StartupNotify=false\n\
+         X-KDE-autostart-phase=2\n\
+         X-GNOME-Autostart-enabled=true\n"
+    )
+}
+
+fn parse_systemctl_is_enabled_output(exit_success: bool, stdout: &str) -> Option<bool> {
+    match stdout.trim() {
+        "enabled" | "enabled-runtime" | "linked" | "linked-runtime" | "alias" | "static" => {
+            Some(true)
+        }
+        "disabled" | "masked" | "masked-runtime" | "indirect" | "not-found" => Some(false),
+        _ if exit_success => Some(true),
+        _ => None,
+    }
+}
+
+/// Reads the live system autostart state without mutating disk or systemd:
+/// - When a `systemd --user` unit exists: queries `systemctl --user is-enabled breeze-autoscroll.service`.
+/// - Otherwise: checks whether the fallback XDG autostart `.desktop` file exists.
+pub fn detect_system_autostart_enabled() -> Option<bool> {
+    match detect_autostart_backend() {
+        AutostartBackend::SystemdUser => {
+            let output = Command::new("systemctl")
+                .args(["--user", "is-enabled", SYSTEMD_USER_UNIT_NAME])
+                .stdin(Stdio::null())
+                .output()
+                .ok()?;
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            parse_systemctl_is_enabled_output(output.status.success(), &stdout)
+        }
+        AutostartBackend::XdgAutostartDesktop => {
+            let xdg = env::var_os("XDG_CONFIG_HOME");
+            let home = env::var_os("HOME");
+            let primary = autostart_desktop_paths_from(xdg.as_deref(), home.as_deref())
+                .into_iter()
+                .next()?;
+            let exists = fs::symlink_metadata(&primary)
+                .is_ok_and(|m| !m.file_type().is_symlink() && m.is_file());
+            Some(exists)
+        }
+    }
+}
+
+/// Synchronizes autostart cleanly using a single mechanism:
+/// - If `breeze-autoscroll.service` exists as a systemd user unit: toggles via
+///   `systemctl --user enable/disable breeze-autoscroll.service` (without `--now`) and removes
+///   any legacy `~/.config/autostart/breeze-autoscroll.desktop` file.
+/// - Only if no systemd user unit exists: falls back to XDG autostart `.desktop` written via
+///   `write_file_atomic_secure(..., false)` with Freedesktop `Exec` escaping and no shebang.
+pub fn sync_kde_autostart(enabled: bool) {
+    let xdg = env::var_os("XDG_CONFIG_HOME");
+    let home = env::var_os("HOME");
+    let desktop_paths = autostart_desktop_paths_from(xdg.as_deref(), home.as_deref());
+
+    match detect_autostart_backend() {
+        AutostartBackend::SystemdUser => {
+            let action = if enabled { "enable" } else { "disable" };
+            let _ = Command::new("systemctl")
+                .args(["--user", action, SYSTEMD_USER_UNIT_NAME])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+
+            // Prevent double-start at login by cleaning up any legacy XDG autostart entry.
+            for legacy_path in &desktop_paths {
+                remove_regular_file_no_symlink(legacy_path);
+            }
+        }
+        AutostartBackend::XdgAutostartDesktop => {
+            let Some(desktop_file) = desktop_paths.first() else {
+                return;
+            };
+            if enabled {
+                let exec_path = env::current_exe()
+                    .ok()
+                    .and_then(|p| p.to_str().map(str::to_string))
+                    .unwrap_or_else(|| "breeze-autoscroll".to_string());
+                let content = render_autostart_desktop_entry(&exec_path);
+                let _ = write_file_atomic_secure(desktop_file, content.as_bytes(), false);
+            } else {
+                for path in &desktop_paths {
+                    remove_regular_file_no_symlink(path);
+                }
+            }
+        }
     }
 }
 
@@ -948,5 +1184,110 @@ mod tests {
         assert_eq!(reset_cfg.mode, "smart");
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn desktop_exec_escaping_handles_reserved_chars_percents_and_rejects_newlines() {
+        // Simple path remains unquoted
+        assert_eq!(
+            escape_desktop_exec_arg("/usr/bin/breeze-autoscroll").unwrap(),
+            "/usr/bin/breeze-autoscroll"
+        );
+        // Literal percent is doubled even without quoting
+        assert_eq!(
+            escape_desktop_exec_arg("/opt/100%/breeze-autoscroll").unwrap(),
+            "/opt/100%%/breeze-autoscroll"
+        );
+        // Spaces trigger double-quoting
+        assert_eq!(
+            escape_desktop_exec_arg("/home/alice/My Apps/breeze-autoscroll").unwrap(),
+            "\"/home/alice/My Apps/breeze-autoscroll\""
+        );
+        // Reserved characters + Desktop Entry string-unescape + Exec-quoting rules
+        assert_eq!(
+            escape_desktop_exec_arg(r#"/tmp/a "b" $HOME `id` \path %u"#).unwrap(),
+            r#""/tmp/a \\"b\\" \\$HOME \\`id\\` \\\\path %%u""#
+        );
+        // Semicolon / parentheses trigger quoting
+        assert_eq!(
+            escape_desktop_exec_arg("/opt/app(1);test/bin").unwrap(),
+            "\"/opt/app(1);test/bin\""
+        );
+        // Control characters must be rejected to prevent desktop entry key injection
+        assert!(escape_desktop_exec_arg("/usr/bin/ok\nHidden=true").is_err());
+        assert!(escape_desktop_exec_arg("/usr/bin/ok\rHidden=true").is_err());
+        assert!(escape_desktop_exec_arg("/usr/bin/ok\0bad").is_err());
+        assert_eq!(
+            format_desktop_exec_path("/usr/bin/ok\nHidden=true"),
+            "breeze-autoscroll"
+        );
+
+        // Fallback desktop file must not include xdg-open shebang and must quote Exec cleanly
+        let desktop = render_autostart_desktop_entry("/home/alice/My Bin/breeze-autoscroll");
+        assert!(desktop.starts_with("[Desktop Entry]\n"));
+        assert!(!desktop.contains("#!/usr/bin/env xdg-open"));
+        assert!(desktop.contains("Exec=\"/home/alice/My Bin/breeze-autoscroll\"\n"));
+    }
+
+    #[test]
+    fn autostart_backend_detection_checks_systemd_unit_paths_and_systemctl_output() {
+        let base = temp_config_dir("autostart_detect");
+        let xdg = base.join("xdg");
+        let home = base.join("home");
+
+        let candidates = systemd_user_unit_candidates_from(
+            Some(xdg.as_os_str()),
+            Some(home.as_os_str()),
+        );
+        assert_eq!(
+            candidates,
+            vec![
+                xdg.join("systemd/user/breeze-autoscroll.service"),
+                home.join(".config/systemd/user/breeze-autoscroll.service"),
+                PathBuf::from("/etc/systemd/user/breeze-autoscroll.service"),
+                PathBuf::from("/usr/lib/systemd/user/breeze-autoscroll.service"),
+            ]
+        );
+
+        // Isolated candidate list without any unit file -> XdgAutostartDesktop fallback
+        let isolated = vec![
+            xdg.join("systemd/user/breeze-autoscroll.service"),
+            home.join(".config/systemd/user/breeze-autoscroll.service"),
+        ];
+        assert_eq!(
+            detect_autostart_backend_in(&isolated),
+            AutostartBackend::XdgAutostartDesktop
+        );
+
+        // Once user unit exists -> SystemdUser
+        fs::create_dir_all(xdg.join("systemd/user")).unwrap();
+        fs::write(&isolated[0], b"[Unit]\nDescription=Test\n").unwrap();
+        assert_eq!(
+            detect_autostart_backend_in(&isolated),
+            AutostartBackend::SystemdUser
+        );
+
+        // systemctl is-enabled output parsing
+        assert_eq!(parse_systemctl_is_enabled_output(true, "enabled\n"), Some(true));
+        assert_eq!(
+            parse_systemctl_is_enabled_output(true, "enabled-runtime\n"),
+            Some(true)
+        );
+        assert_eq!(
+            parse_systemctl_is_enabled_output(false, "disabled\n"),
+            Some(false)
+        );
+        assert_eq!(
+            parse_systemctl_is_enabled_output(false, "masked\n"),
+            Some(false)
+        );
+        assert_eq!(
+            parse_systemctl_is_enabled_output(false, "not-found\n"),
+            Some(false)
+        );
+        // Bus/environment error returns None (do not clobber config)
+        assert_eq!(parse_systemctl_is_enabled_output(false, ""), None);
+
+        let _ = fs::remove_dir_all(&base);
     }
 }

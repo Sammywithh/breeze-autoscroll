@@ -3,7 +3,7 @@
 # Build Script: Erstellt ein Debian Package (.deb) für Breeze Autoscroll (Rust)
 # ==============================================================================
 
-set -e
+set -euo pipefail
 umask 022
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -18,20 +18,18 @@ echo "============================================================"
 echo "  Breeze Autoscroll v${VERSION} - DEB Package Builder (${ARCH})"
 echo "============================================================"
 
-# Build release binary if Cargo is available, otherwise reuse prebuilt ./breeze-autoscroll
-BIN_PATH=""
-if command -v cargo &>/dev/null && [ -f "Cargo.toml" ]; then
-    echo "Kompiliere Release-Binary..."
-    cargo build --release --locked
-    BIN_PATH="target/release/${PKG_NAME}"
-    cp "${BIN_PATH}" "./${PKG_NAME}"
-    chmod 755 "./${PKG_NAME}"
-elif [ -x "./${PKG_NAME}" ]; then
-    BIN_PATH="./${PKG_NAME}"
-else
-    echo "Fehler: Kein Rust-Binary zum Paketieren gefunden." >&2
+# Build release binary deterministically from source (no unverified prebuilt fallback)
+if ! command -v cargo &>/dev/null; then
+    echo "Fehler: 'cargo' (Rust Toolchain) wurde nicht gefunden. Bitte installiere Rust/Cargo für einen deterministischen Build." >&2
     exit 1
 fi
+if [ ! -f "Cargo.toml" ]; then
+    echo "Fehler: 'Cargo.toml' im Repository-Verzeichnis nicht gefunden." >&2
+    exit 1
+fi
+echo "Kompiliere Release-Binary deterministisch (--locked)..."
+cargo build --release --locked
+BIN_PATH="target/release/${PKG_NAME}"
 
 echo "Erstelle Paketstruktur in ${BUILD_DIR}..."
 rm -rf "${BUILD_DIR}"
@@ -74,10 +72,10 @@ EOF
 # DEBIAN/postinst - Post-Installations-Skript (Least Privilege: kein globales usermod -aG input)
 cat << 'EOF' > "${BUILD_DIR}/DEBIAN/postinst"
 #!/usr/bin/env bash
-set -e
+set -euo pipefail
 umask 022
 
-if [ "$1" = "configure" ]; then
+if [ "${1:-}" = "configure" ]; then
     echo "Entferne veraltete udev-Regel (falls vorhanden)..."
     rm -f /etc/udev/rules.d/99-uinput-autoscroll.rules || true
 
@@ -108,16 +106,15 @@ chmod 755 "${BUILD_DIR}/DEBIAN/postinst"
 # DEBIAN/postrm - Post-Removal-Skript
 cat << 'EOF' > "${BUILD_DIR}/DEBIAN/postrm"
 #!/usr/bin/env bash
-set -e
+set -euo pipefail
 umask 022
 
-if [ "$1" = "remove" ] || [ "$1" = "purge" ]; then
+if [ "${1:-}" = "remove" ] || [ "${1:-}" = "purge" ]; then
     rm -f /etc/modules-load.d/breeze-autoscroll-uinput.conf
     rm -f /etc/udev/rules.d/99-uinput-autoscroll.rules || true
     udevadm control --reload-rules || true
     udevadm trigger --subsystem-match=misc --sysname-match=uinput || true
     udevadm trigger --subsystem-match=input --property-match=ID_INPUT_MOUSE=1 || true
-    systemctl --global daemon-reload || true
 fi
 exit 0
 EOF
