@@ -28,13 +28,18 @@ rm -f "${HOME}/.config/autostart/breeze-autoscroll.desktop"
 rm -f "${HOME}/.config/systemd/user/breeze-autoscroll.service"
 rm -rf "${HOME}/.local/share/breeze-autoscroll"
 rm -rf "${HOME}/.cache/breeze-autoscroll"
+if [ -n "${XDG_RUNTIME_DIR:-}" ]; then
+    rm -rf "${XDG_RUNTIME_DIR}/breeze-autoscroll"
+fi
 
-# 4. Optional removal of udev rule
-if [ -f /etc/udev/rules.d/99-uinput-autoscroll.rules ]; then
+# 4. Optional removal of udev rules (current 70- and legacy 99-)
+if [ -f /etc/udev/rules.d/70-uinput-autoscroll.rules ] || [ -f /etc/udev/rules.d/99-uinput-autoscroll.rules ]; then
     if command -v sudo &>/dev/null && [ "$EUID" -ne 0 ]; then
-        echo "Entferne udev-Regel..."
-        sudo rm -f /etc/udev/rules.d/99-uinput-autoscroll.rules 2>/dev/null || true
+        echo "Entferne udev-Regeln..."
+        sudo rm -f /etc/udev/rules.d/70-uinput-autoscroll.rules /etc/udev/rules.d/99-uinput-autoscroll.rules 2>/dev/null || true
         sudo udevadm control --reload-rules 2>/dev/null || true
+        sudo udevadm trigger --subsystem-match=misc --sysname-match=uinput 2>/dev/null || true
+        sudo udevadm trigger --subsystem-match=input --property-match=ID_INPUT_MOUSE=1 2>/dev/null || true
     fi
 fi
 

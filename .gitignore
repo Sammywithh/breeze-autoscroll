@@ -1,6 +1,9 @@
 /target/
 /dist/
 /artifacts/
+/breeze-autoscroll
+*.deb
 *.deb.tmp
+audit_bundle.txt
 __pycache__/
 *.pyc

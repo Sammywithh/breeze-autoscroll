@@ -356,6 +356,21 @@ impl eframe::App for SettingsApp {
                                     "Unterdrückt Autoscroll zusätzlich auch bei längerem Gedrückthalten über Hand-Cursor-Links, Titelleisten/Tableisten und AT-SPI2-UI-Elementen.",
                                 )
                                 .changed();
+
+                            if self.draft.ignore_hyperlinks_and_tabs {
+                                ui.horizontal(|ui| {
+                                    ui.add_space(22.0);
+                                    changed |= ui
+                                        .checkbox(
+                                            &mut self.draft.auto_enable_atspi,
+                                            "AT-SPI2 bei Bedarf für die Desktop-Sitzung aktivieren (Opt-in)",
+                                        )
+                                        .on_hover_text(
+                                            "Standardmäßig aus: AT-SPI2 wird nur abgefragt, wenn Barrierefreiheit in KDE bereits aktiv ist. Aktivieren, um AT-SPI2 automatisch einzuschalten.",
+                                        )
+                                        .changed();
+                                });
+                            }
                         });
 
                         ui.add_space(10.0);

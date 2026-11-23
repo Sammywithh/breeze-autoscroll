@@ -43,7 +43,7 @@ cd ~/KI-Agentic-Projects/breeze-autoscroll
 Das Skript erledigt automatisch:
 1. Kompilierung / Installation des nativen Rust-Binaries nach `~/.local/bin/breeze-autoscroll`
 2. Einrichtung von Desktop-, Autostart- und Systemd-User-Service-Einträgen
-3. Konfiguration der `uinput`-Berechtigungen via udev-Regel (`/etc/udev/rules.d/99-uinput-autoscroll.rules`)
+3. Konfiguration gehärteter Least-Privilege-Berechtigungen via udev-Regel (`/etc/udev/rules.d/70-uinput-autoscroll.rules` mit `TAG+="uaccess"`)
 
 Alternativ kannst du ein Debian-Paket (`.deb`) erstellen oder direkt installieren:
 
@@ -99,6 +99,13 @@ breeze-autoscroll --settings
 
 ---
 
-## 🔒 Berechtigungen (`/dev/uinput`)
+## 🔒 Berechtigungen (`/dev/uinput` & Least Privilege)
 
-Damit der Dienst ohne Root-Rechte virtuelle Scroll-Events senden kann, muss dein Benutzer Zugriff auf `/dev/uinput` und die Eingabegeräte haben. Dies wird über `/etc/udev/rules.d/99-uinput-autoscroll.rules` und die Gruppe `input` automatisch eingerichtet. Nach erstmaliger Gruppenaufnahme einmal ab- und wieder anmelden.
+Damit der Dienst ohne Root-Rechte und ohne globale `input`-Gruppenmitgliedschaft virtuelle Scroll-Events senden kann, richtet `/etc/udev/rules.d/70-uinput-autoscroll.rules` (Priorität `70`, vor `73-seat-late.rules`) gezielte `TAG+="uaccess"`-ACLs ausschließlich für die aktive lokale Desktop-Sitzung ein:
+
+- `/dev/uinput` (`MODE="0600"`, `TAG+="uaccess"`)
+- Reine Maus-Event-Geräte (`ENV{ID_INPUT_MOUSE}=="1"`, `ENV{ID_INPUT_KEYBOARD}!="1"`, `TAG+="uaccess"`)
+
+Tastaturen werden **nicht** freigegeben und im Leerlauf auch nicht geöffnet. Weder `install.sh` noch das `.deb`-Paket fügen Benutzer automatisch zur Gruppe `input` hinzu.
+
+**Optionaler separater Pfad:** Falls ein spezielles Zeigegerät nicht als `ID_INPUT_MOUSE=1` klassifiziert wird oder explizit `ESC`-Abbruch per `evdev` (wird nur während aktivem Autoscroll geöffnet) gewünscht ist, kann entweder eine gezielte `uaccess`-Regel für die jeweilige Vendor-/Product-ID hinterlegt oder ein einzelner Nutzer manuell zur Gruppe `input` hinzugefügt werden (`sudo usermod -aG input <benutzername>`, danach neu anmelden).

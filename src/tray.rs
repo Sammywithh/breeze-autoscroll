@@ -4,15 +4,17 @@
 use std::collections::HashMap;
 use std::env;
 use std::process::{Child, Command};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use zbus::fdo::DBusProxy;
+use zbus::message::Header;
 use zbus::object_server::SignalEmitter;
 use zbus::wire::{OwnedObjectPath, OwnedVariant, Str, Structure, Variant};
 use zbus::{Connection, ObjectServer, Proxy, connection, interface};
 
-use crate::config::ConfigManager;
+use crate::config::{ConfigManager, truncate_utf8_bytes};
 use crate::window_detector::WindowTracker;
 
 pub const SERVICE_NAME: &str = "org.breeze.Autoscroll";
@@ -20,7 +22,181 @@ pub const AUTOSCROLL_PATH: &str = "/Autoscroll";
 pub const SNI_PATH: &str = "/StatusNotifierItem";
 pub const MENU_PATH: &str = "/MenuBar";
 
+const KWIN_BUS_NAME: &str = "org.kde.KWin";
+const KWIN_OWNER_CACHE_TTL: Duration = Duration::from_secs(10);
+const KWIN_MISMATCH_REFRESH_COOLDOWN: Duration = Duration::from_millis(200);
+const KWIN_WARMUP_TIMEOUT_MS: u64 = 250;
+
+const MAX_DBUS_META_BYTES: usize = 256;
+const MAX_DBUS_TITLE_BYTES: usize = 1024;
+const MAX_DBUS_COORD_BYTES: usize = 128;
+const MAX_MENU_GROUP_IDS: usize = 64;
+const MAX_MENU_PROP_NAME_BYTES: usize = 64;
+
 pub type MenuItem = (i32, HashMap<String, OwnedVariant>, Vec<OwnedVariant>);
+
+fn clamp_dbus_str(s: String, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        s
+    } else {
+        truncate_utf8_bytes(&s, max_bytes).to_string()
+    }
+}
+
+/// Event-driven quit handle shared between the D-Bus tray menu and `main`'s `poll()` loop.
+#[derive(Clone)]
+pub struct QuitNotifier {
+    requested: Arc<AtomicBool>,
+    wake_write_fd: Arc<AtomicI32>,
+}
+
+impl QuitNotifier {
+    pub fn new(requested: Arc<AtomicBool>, wake_write_fd: Arc<AtomicI32>) -> Self {
+        Self {
+            requested,
+            wake_write_fd,
+        }
+    }
+
+    pub fn request_quit(&self) {
+        self.requested.store(true, Ordering::SeqCst);
+        let fd = self.wake_write_fd.load(Ordering::Acquire);
+        if fd >= 0 {
+            let byte = [b'Q'];
+            unsafe {
+                let _ = libc::write(fd, byte.as_ptr().cast::<libc::c_void>(), 1);
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VerifyDecision {
+    Allow,
+    Deny,
+    RefreshNeeded,
+}
+
+#[derive(Debug, Default)]
+struct KWinOwnerCache {
+    owner: Option<String>,
+    refreshed_at: Option<Instant>,
+    last_mismatch_refresh: Option<Instant>,
+}
+
+impl KWinOwnerCache {
+    fn seed(&mut self, owner: Option<String>, now: Instant) {
+        self.owner = owner;
+        self.refreshed_at = Some(now);
+    }
+
+    fn check(&self, sender: &str, now: Instant) -> VerifyDecision {
+        if sender.is_empty() {
+            return VerifyDecision::Deny;
+        }
+        if self.owner.as_deref() == Some(sender)
+            && self
+                .refreshed_at
+                .is_some_and(|t| now.saturating_duration_since(t) < KWIN_OWNER_CACHE_TTL)
+        {
+            return VerifyDecision::Allow;
+        }
+        if self.owner.as_deref() != Some(sender)
+            && self
+                .last_mismatch_refresh
+                .is_some_and(|t| now.saturating_duration_since(t) < KWIN_MISMATCH_REFRESH_COOLDOWN)
+        {
+            return VerifyDecision::Deny;
+        }
+        VerifyDecision::RefreshNeeded
+    }
+
+    fn update_and_verify(&mut self, fresh_owner: Option<String>, sender: &str, now: Instant) -> bool {
+        self.owner = fresh_owner;
+        self.refreshed_at = Some(now);
+        let allowed = !sender.is_empty() && self.owner.as_deref() == Some(sender);
+        if !allowed {
+            self.last_mismatch_refresh = Some(now);
+        }
+        allowed
+    }
+}
+
+/// Verifies that incoming KWin callback D-Bus messages genuinely originate from the
+/// current unique-name owner of `org.kde.KWin`.
+#[derive(Clone, Default)]
+struct KWinOwnerVerifier {
+    cache: Arc<Mutex<KWinOwnerCache>>,
+}
+
+impl KWinOwnerVerifier {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    async fn query_owner(conn: &Connection) -> Option<String> {
+        let dbus = DBusProxy::new(conn).await.ok()?;
+        let name = KWIN_BUS_NAME.try_into().ok()?;
+        dbus.get_name_owner(name).await.ok().map(|u| u.to_string())
+    }
+
+    /// Pre-warms the cached `org.kde.KWin` owner at daemon startup using a short D-Bus timeout
+    /// so the very first middle-click incurs zero extra lookup latency.
+    async fn warm_up(&self) {
+        let Ok(short_conn) = connection::Builder::session()
+            .method_timeout(Duration::from_millis(KWIN_WARMUP_TIMEOUT_MS))
+            .build()
+            .await
+        else {
+            return;
+        };
+        if let Some(owner) = Self::query_owner(&short_conn).await
+            && let Ok(mut guard) = self.cache.lock()
+        {
+            guard.seed(Some(owner), Instant::now());
+        }
+    }
+
+    async fn verify_kwin_sender(
+        &self,
+        conn: &Connection,
+        header: &Header<'_>,
+    ) -> zbus::fdo::Result<()> {
+        let sender = header
+            .sender()
+            .map(|s| s.as_str())
+            .ok_or_else(|| zbus::fdo::Error::AccessDenied("Fehlender D-Bus-Sender".to_string()))?;
+
+        let now = Instant::now();
+        let decision = self
+            .cache
+            .lock()
+            .map(|g| g.check(sender, now))
+            .unwrap_or(VerifyDecision::RefreshNeeded);
+
+        match decision {
+            VerifyDecision::Allow => Ok(()),
+            VerifyDecision::Deny => Err(zbus::fdo::Error::AccessDenied(
+                "Nur org.kde.KWin darf diese Methode aufrufen".to_string(),
+            )),
+            VerifyDecision::RefreshNeeded => {
+                let fresh_owner = Self::query_owner(conn).await;
+                let allowed = self
+                    .cache
+                    .lock()
+                    .map(|mut g| g.update_and_verify(fresh_owner, sender, Instant::now()))
+                    .unwrap_or(false);
+                if allowed {
+                    Ok(())
+                } else {
+                    Err(zbus::fdo::Error::AccessDenied(
+                        "Nur org.kde.KWin darf diese Methode aufrufen".to_string(),
+                    ))
+                }
+            }
+        }
+    }
+}
 
 /// Renders a crisp 64x64 (or `size x size`) KDE Breeze tray icon in big-endian ARGB32
 /// byte order (`[A, R, G, B]`), as required by `org.kde.StatusNotifierItem.IconPixmap`.
@@ -163,13 +339,26 @@ fn point_in_triangle(
 struct TraySharedState {
     config: ConfigManager,
     window_tracker: WindowTracker,
-    quit_requested: Arc<AtomicBool>,
+    quit_notifier: QuitNotifier,
+    kwin_verifier: KWinOwnerVerifier,
     menu_revision: Arc<AtomicU32>,
     settings_child: Arc<Mutex<Option<Child>>>,
     about_child: Arc<Mutex<Option<Child>>>,
 }
 
 impl TraySharedState {
+    fn reap_slot(slot: &Arc<Mutex<Option<Child>>>) {
+        let Ok(mut guard) = slot.lock() else {
+            return;
+        };
+        if let Some(child) = guard.as_mut() {
+            match child.try_wait() {
+                Ok(Some(_)) | Err(_) => *guard = None,
+                Ok(None) => {}
+            }
+        }
+    }
+
     fn spawn_child_window(slot: &Arc<Mutex<Option<Child>>>, flag: &str) {
         let Ok(mut guard) = slot.lock() else {
             return;
@@ -194,6 +383,29 @@ impl TraySharedState {
 
     fn open_about(&self) {
         Self::spawn_child_window(&self.about_child, "--about");
+    }
+
+    fn reap_exited_children(&self) {
+        Self::reap_slot(&self.settings_child);
+        Self::reap_slot(&self.about_child);
+    }
+}
+
+/// Handle to the running session D-Bus & KDE System Tray service.
+pub struct TrayService {
+    _conn: Connection,
+    state: TraySharedState,
+}
+
+impl TrayService {
+    /// Opens (or focuses if already running) the tracked `--settings-window` child process.
+    pub fn open_settings(&self) {
+        self.state.open_settings();
+    }
+
+    /// Reaps any exited `--settings-window` or `--about` child processes so no zombies remain.
+    pub fn reap_exited_children(&self) {
+        self.state.reap_exited_children();
     }
 }
 
@@ -232,11 +444,13 @@ impl AutoscrollControlIface {
     #[zbus(name = "ReloadConfig")]
     async fn reload_config(&self, #[zbus(object_server)] server: &ObjectServer) {
         self.state.config.load();
+        self.state.window_tracker.sync_atspi_config();
         emit_tray_refresh(server, &self.state).await;
     }
 
+    #[allow(clippy::too_many_arguments)]
     #[zbus(name = "UpdateActiveWindow")]
-    fn update_active_window(
+    async fn update_active_window(
         &self,
         app_class: String,
         app_name: String,
@@ -244,17 +458,32 @@ impl AutoscrollControlIface {
         title: String,
         cursor_x: String,
         cursor_y: String,
-    ) {
+        #[zbus(connection)] conn: &Connection,
+        #[zbus(header)] header: Header<'_>,
+    ) -> zbus::fdo::Result<()> {
+        self.state
+            .kwin_verifier
+            .verify_kwin_sender(conn, &header)
+            .await?;
+
+        let app_class = clamp_dbus_str(app_class, MAX_DBUS_META_BYTES);
+        let app_name = clamp_dbus_str(app_name, MAX_DBUS_META_BYTES);
+        let desktop_file = clamp_dbus_str(desktop_file, MAX_DBUS_META_BYTES);
+        let title = clamp_dbus_str(title, MAX_DBUS_TITLE_BYTES);
+        let cursor_x = clamp_dbus_str(cursor_x, MAX_DBUS_COORD_BYTES);
+        let cursor_y = clamp_dbus_str(cursor_y, MAX_DBUS_COORD_BYTES);
+
         let cx = cursor_x.trim().parse::<i32>().ok();
         let cy = cursor_y.trim().parse::<i32>().ok();
         self.state
             .window_tracker
             .update_from_kwin(app_class, app_name, desktop_file, title, cx, cy);
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
     #[zbus(name = "ReportPointerProbe")]
-    fn report_pointer_probe(
+    async fn report_pointer_probe(
         &self,
         coords: String,
         app_class: String,
@@ -264,28 +493,82 @@ impl AutoscrollControlIface {
         is_dock_or_desktop: String,
         win_geom: String,
         screen_geom: String,
-    ) {
+        #[zbus(connection)] conn: &Connection,
+        #[zbus(header)] header: Header<'_>,
+    ) -> zbus::fdo::Result<()> {
+        self.state
+            .kwin_verifier
+            .verify_kwin_sender(conn, &header)
+            .await?;
+
+        let coords = clamp_dbus_str(coords, MAX_DBUS_COORD_BYTES);
+        let app_class = clamp_dbus_str(app_class, MAX_DBUS_META_BYTES);
+        let app_name = clamp_dbus_str(app_name, MAX_DBUS_META_BYTES);
+        let desktop_file = clamp_dbus_str(desktop_file, MAX_DBUS_META_BYTES);
+        let title = clamp_dbus_str(title, MAX_DBUS_TITLE_BYTES);
+        let is_dock_or_desktop = clamp_dbus_str(is_dock_or_desktop, MAX_DBUS_COORD_BYTES);
+        let win_geom = clamp_dbus_str(win_geom, MAX_DBUS_COORD_BYTES);
+        let screen_geom = clamp_dbus_str(screen_geom, MAX_DBUS_COORD_BYTES);
+
         let mut coord_parts = coords.split(',');
-        let cx = coord_parts.next().and_then(|s| s.trim().parse::<i32>().ok()).unwrap_or(0);
-        let cy = coord_parts.next().and_then(|s| s.trim().parse::<i32>().ok()).unwrap_or(0);
-        let vw = coord_parts.next().and_then(|s| s.trim().parse::<i32>().ok()).unwrap_or(0);
-        let vh = coord_parts.next().and_then(|s| s.trim().parse::<i32>().ok()).unwrap_or(0);
+        let cx = coord_parts
+            .next()
+            .and_then(|s| s.trim().parse::<i32>().ok())
+            .unwrap_or(0);
+        let cy = coord_parts
+            .next()
+            .and_then(|s| s.trim().parse::<i32>().ok())
+            .unwrap_or(0);
+        let vw = coord_parts
+            .next()
+            .and_then(|s| s.trim().parse::<i32>().ok())
+            .unwrap_or(0);
+        let vh = coord_parts
+            .next()
+            .and_then(|s| s.trim().parse::<i32>().ok())
+            .unwrap_or(0);
         let dock_or_desktop = is_dock_or_desktop.trim() == "1";
 
         let mut win_parts = win_geom.split(',');
-        let wx = win_parts.next().and_then(|s| s.trim().parse::<i32>().ok()).unwrap_or(0);
-        let wy = win_parts.next().and_then(|s| s.trim().parse::<i32>().ok()).unwrap_or(0);
-        let ww = win_parts.next().and_then(|s| s.trim().parse::<i32>().ok()).unwrap_or(0);
-        let wh = win_parts.next().and_then(|s| s.trim().parse::<i32>().ok()).unwrap_or(0);
+        let wx = win_parts
+            .next()
+            .and_then(|s| s.trim().parse::<i32>().ok())
+            .unwrap_or(0);
+        let wy = win_parts
+            .next()
+            .and_then(|s| s.trim().parse::<i32>().ok())
+            .unwrap_or(0);
+        let ww = win_parts
+            .next()
+            .and_then(|s| s.trim().parse::<i32>().ok())
+            .unwrap_or(0);
+        let wh = win_parts
+            .next()
+            .and_then(|s| s.trim().parse::<i32>().ok())
+            .unwrap_or(0);
         let fullscreen = win_parts.next().is_some_and(|s| s.trim() == "1");
         let borderless = win_parts.next().is_some_and(|s| s.trim() == "1");
-        let w_pid = win_parts.next().and_then(|s| s.trim().parse::<u32>().ok()).unwrap_or(0);
+        let w_pid = win_parts
+            .next()
+            .and_then(|s| s.trim().parse::<u32>().ok())
+            .unwrap_or(0);
 
         let mut scr_parts = screen_geom.split(',');
-        let sx = scr_parts.next().and_then(|s| s.trim().parse::<i32>().ok()).unwrap_or(0);
-        let sy = scr_parts.next().and_then(|s| s.trim().parse::<i32>().ok()).unwrap_or(0);
-        let s_scale = scr_parts.next().and_then(|s| s.trim().parse::<f64>().ok()).unwrap_or(1.0);
+        let sx = scr_parts
+            .next()
+            .and_then(|s| s.trim().parse::<i32>().ok())
+            .unwrap_or(0);
+        let sy = scr_parts
+            .next()
+            .and_then(|s| s.trim().parse::<i32>().ok())
+            .unwrap_or(0);
+        let s_scale = scr_parts
+            .next()
+            .and_then(|s| s.trim().parse::<f64>().ok())
+            .filter(|v| v.is_finite())
+            .unwrap_or(1.0);
 
+        // Strictly non-blocking: AT-SPI2 / DRM / X11 enrichment happens off the zbus thread.
         self.state.window_tracker.report_pointer_probe(
             cx,
             cy,
@@ -307,23 +590,57 @@ impl AutoscrollControlIface {
             sy,
             s_scale,
         );
+        Ok(())
     }
 
     #[zbus(name = "UpdateCursorPos")]
-    fn update_cursor_pos(&self, cursor_x: String, cursor_y: String) {
+    async fn update_cursor_pos(
+        &self,
+        cursor_x: String,
+        cursor_y: String,
+        #[zbus(connection)] conn: &Connection,
+        #[zbus(header)] header: Header<'_>,
+    ) -> zbus::fdo::Result<()> {
+        self.state
+            .kwin_verifier
+            .verify_kwin_sender(conn, &header)
+            .await?;
+
+        let cursor_x = clamp_dbus_str(cursor_x, MAX_DBUS_COORD_BYTES);
+        let cursor_y = clamp_dbus_str(cursor_y, MAX_DBUS_COORD_BYTES);
         if let (Ok(cx), Ok(cy)) = (
             cursor_x.trim().parse::<i32>(),
             cursor_y.trim().parse::<i32>(),
         ) {
             self.state.window_tracker.update_cursor_pos(cx, cy);
         }
+        Ok(())
     }
 
     #[zbus(name = "NotifyWindowContextChanged")]
-    fn notify_window_context_changed(&self) {
-        self.state.window_tracker.notify_window_context_changed();
-    }
+    async fn notify_window_context_changed(
+        &self,
+        #[zbus(connection)] conn: &Connection,
+        #[zbus(header)] header: Header<'_>,
+    ) -> zbus::fdo::Result<()> {
+        self.state
+            .kwin_verifier
+            .verify_kwin_sender(conn, &header)
+            .await?;
 
+        self.state.window_tracker.notify_window_context_changed();
+        Ok(())
+    }
+}
+
+#[cfg(feature = "debug-dbus")]
+struct AutoscrollDebugIface {
+    state: TraySharedState,
+}
+
+#[cfg(feature = "debug-dbus")]
+#[interface(name = "org.breeze.Autoscroll.Debug")]
+impl AutoscrollDebugIface {
     #[zbus(name = "TriggerProbe")]
     fn trigger_probe(&self) {
         self.state.window_tracker.trigger_probe();
@@ -335,7 +652,7 @@ impl AutoscrollControlIface {
         let Some(probe) = self.state.window_tracker.last_probe_snapshot() else {
             return "none".to_string();
         };
-        let cfg = self.state.config.snapshot();
+        let cfg = self.state.config.current();
         let interactive_chrome =
             crate::window_detector::is_interactive_window_chrome(&probe, &cfg);
         let win_desc = probe
@@ -417,7 +734,7 @@ impl StatusNotifierItemIface {
 
     #[zbus(property, name = "IconPixmap")]
     fn icon_pixmap(&self) -> Vec<(i32, i32, Vec<u8>)> {
-        let enabled = self.state.config.snapshot().enabled;
+        let enabled = self.state.config.current().enabled;
         vec![
             (32, 32, render_tray_icon_argb32_be(enabled, 32)),
             (64, 64, render_tray_icon_argb32_be(enabled, 64)),
@@ -451,7 +768,7 @@ impl StatusNotifierItemIface {
 
     #[zbus(property, name = "ToolTip")]
     fn tool_tip(&self) -> ToolTip {
-        let cfg = self.state.config.snapshot();
+        let cfg = self.state.config.current();
         let status = if cfg.enabled {
             "Aktiviert"
         } else {
@@ -636,7 +953,7 @@ impl DbusMenuIface {
         _recursion_depth: i32,
         _property_names: Vec<String>,
     ) -> (u32, MenuItem) {
-        let cfg = self.state.config.snapshot();
+        let cfg = self.state.config.current();
         let rev = self.state.menu_revision.load(Ordering::SeqCst);
         if parent_id == MENU_ID_ROOT {
             (rev, build_menu_layout(&cfg))
@@ -651,15 +968,17 @@ impl DbusMenuIface {
         ids: Vec<i32>,
         _property_names: Vec<String>,
     ) -> Vec<(i32, HashMap<String, OwnedVariant>)> {
-        let cfg = self.state.config.snapshot();
+        let cfg = self.state.config.current();
         ids.into_iter()
+            .take(MAX_MENU_GROUP_IDS)
             .map(|id| (id, build_menu_properties(id, &cfg)))
             .collect()
     }
 
     #[zbus(name = "GetProperty")]
     fn get_property(&self, id: i32, name: String) -> zbus::fdo::Result<OwnedVariant> {
-        let cfg = self.state.config.snapshot();
+        let name = clamp_dbus_str(name, MAX_MENU_PROP_NAME_BYTES);
+        let cfg = self.state.config.current();
         build_menu_properties(id, &cfg)
             .remove(&name)
             .ok_or_else(|| zbus::fdo::Error::Failed(format!("Unknown menu property: {name}")))
@@ -697,7 +1016,7 @@ impl DbusMenuIface {
                 self.state.open_about();
             }
             MENU_ID_QUIT => {
-                self.state.quit_requested.store(true, Ordering::SeqCst);
+                self.state.quit_notifier.request_quit();
             }
             _ => {}
         }
@@ -759,36 +1078,49 @@ pub fn notify_daemon_reload_config() {
     });
 }
 
-/// Starts the session D-Bus service (`org.breeze.Autoscroll`, `StatusNotifierItem`, `dbusmenu`)
-/// and registers with KDE Plasma's `StatusNotifierWatcher`.
+/// Starts the session D-Bus service (`org.breeze.Autoscroll`, `StatusNotifierItem`, `dbusmenu`),
+/// pre-warms `KWinOwnerVerifier`, and registers with KDE Plasma's `StatusNotifierWatcher`.
 pub fn start_tray_and_dbus_service(
     config: ConfigManager,
     window_tracker: WindowTracker,
-    quit_requested: Arc<AtomicBool>,
-) -> Result<Connection, String> {
+    quit_notifier: QuitNotifier,
+) -> Result<TrayService, String> {
+    let kwin_verifier = KWinOwnerVerifier::new();
     let shared = TraySharedState {
         config,
         window_tracker,
-        quit_requested,
+        quit_notifier,
+        kwin_verifier: kwin_verifier.clone(),
         menu_revision: Arc::new(AtomicU32::new(1)),
         settings_child: Arc::new(Mutex::new(None)),
         about_child: Arc::new(Mutex::new(None)),
     };
 
+    let shared_for_handle = shared.clone();
     let conn = zbus::block_on(async move {
+        // Pre-warm org.kde.KWin unique owner before first middle-click (short 250ms timeout)
+        kwin_verifier.warm_up().await;
+
         let control = AutoscrollControlIface {
             state: shared.clone(),
         };
         let sni = StatusNotifierItemIface {
             state: shared.clone(),
         };
-        let menu = DbusMenuIface { state: shared };
+        let menu = DbusMenuIface {
+            state: shared.clone(),
+        };
 
-        let conn = connection::Builder::session()
+        let builder = connection::Builder::session()
             .name(SERVICE_NAME)
             .serve_at(AUTOSCROLL_PATH, control)
             .serve_at(SNI_PATH, sni)
-            .serve_at(MENU_PATH, menu)
+            .serve_at(MENU_PATH, menu);
+
+        #[cfg(feature = "debug-dbus")]
+        let builder = builder.serve_at(AUTOSCROLL_PATH, AutoscrollDebugIface { state: shared });
+
+        let conn = builder
             .build()
             .await
             .map_err(|e| format!("D-Bus Session-Verbindung fehlgeschlagen: {e}"))?;
@@ -809,13 +1141,17 @@ pub fn start_tray_and_dbus_service(
         Ok::<Connection, String>(conn)
     })?;
 
-    Ok(conn)
+    Ok(TrayService {
+        _conn: conn,
+        state: shared_for_handle,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::ConfigData;
+    use zbus::object_server::Interface;
 
     #[test]
     fn tray_icon_argb32_renders_expected_dimensions_and_colors() {
@@ -851,5 +1187,103 @@ mod tests {
             i32::try_from(shield_props.get("toggle-state").unwrap()).unwrap(),
             1
         );
+    }
+
+    #[test]
+    fn kwin_owner_cache_verifies_sender_rate_limits_spoofing_and_recovers_on_restart() {
+        let mut cache = KWinOwnerCache::default();
+        let t0 = Instant::now();
+
+        // Warm-up seeds KWin owner -> immediate zero-lookup Allow
+        cache.seed(Some(":1.42".to_string()), t0);
+        assert_eq!(cache.check(":1.42", t0), VerifyDecision::Allow);
+        assert_eq!(cache.check("", t0), VerifyDecision::Deny);
+
+        // Spoofed sender triggers one refresh, then is rate-limited inside cooldown window
+        assert_eq!(cache.check(":1.99", t0), VerifyDecision::RefreshNeeded);
+        assert!(!cache.update_and_verify(Some(":1.42".to_string()), ":1.99", t0));
+        assert_eq!(
+            cache.check(":1.99", t0 + Duration::from_millis(50)),
+            VerifyDecision::Deny
+        );
+
+        // After cooldown, if KWin restarted with a new unique name (:1.105), refresh accepts it
+        let t1 = t0 + Duration::from_millis(250);
+        assert_eq!(cache.check(":1.105", t1), VerifyDecision::RefreshNeeded);
+        assert!(cache.update_and_verify(Some(":1.105".to_string()), ":1.105", t1));
+        assert_eq!(cache.check(":1.105", t1), VerifyDecision::Allow);
+
+        // Expired TTL forces re-verification
+        assert_eq!(
+            cache.check(":1.105", t1 + KWIN_OWNER_CACHE_TTL + Duration::from_secs(1)),
+            VerifyDecision::RefreshNeeded
+        );
+    }
+
+    #[test]
+    fn clamp_dbus_str_truncates_utf8_cleanly() {
+        let ascii = clamp_dbus_str("abcdef".to_string(), 4);
+        assert_eq!(ascii, "abcd");
+
+        // Multi-byte UTF-8 ('ä' = 2 bytes, '€' = 3 bytes) never panics or splits char
+        let utf8 = clamp_dbus_str("a€b".to_string(), 3);
+        assert_eq!(utf8, "a");
+        let utf8_exact = clamp_dbus_str("a€b".to_string(), 4);
+        assert_eq!(utf8_exact, "a€");
+    }
+
+    #[test]
+    fn debug_probe_methods_follow_feature_flag_in_introspection() {
+        let tmp_dir = env::temp_dir().join(format!(
+            "breeze_tray_introspect_{}",
+            std::process::id()
+        ));
+        let mut xml = String::new();
+        let shared = TraySharedState {
+            config: ConfigManager::try_new(Some(tmp_dir.clone())).unwrap(),
+            window_tracker: WindowTracker::new(),
+            quit_notifier: QuitNotifier::new(
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicI32::new(-1)),
+            ),
+            kwin_verifier: KWinOwnerVerifier::new(),
+            menu_revision: Arc::new(AtomicU32::new(1)),
+            settings_child: Arc::new(Mutex::new(None)),
+            about_child: Arc::new(Mutex::new(None)),
+        };
+        let iface = AutoscrollControlIface {
+            state: shared.clone(),
+        };
+        iface.introspect_to_writer(&mut xml, 0);
+        assert!(!xml.contains("GetLastProbe"));
+        assert!(!xml.contains("TriggerProbe"));
+
+        #[cfg(feature = "debug-dbus")]
+        {
+            let mut debug_xml = String::new();
+            let debug_iface = AutoscrollDebugIface { state: shared };
+            debug_iface.introspect_to_writer(&mut debug_xml, 0);
+            assert!(debug_xml.contains("GetLastProbe"));
+            assert!(debug_xml.contains("TriggerProbe"));
+        }
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn reap_slot_clears_finished_child_without_leaving_zombie() {
+        let slot: Arc<Mutex<Option<Child>>> = Arc::new(Mutex::new(None));
+        let child = Command::new("/bin/true").spawn().unwrap();
+        *slot.lock().unwrap() = Some(child);
+
+        // Wait briefly for /bin/true to exit, then reap via TraySharedState::reap_slot
+        for _ in 0..50 {
+            TraySharedState::reap_slot(&slot);
+            if slot.lock().unwrap().is_none() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(slot.lock().unwrap().is_none());
     }
 }

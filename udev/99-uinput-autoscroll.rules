@@ -1,5 +1,0 @@
-# ==============================================================================
-# Breeze Autoscroll - udev rules for uinput access without root
-# ==============================================================================
-KERNEL=="uinput", MODE="0660", GROUP="input", OPTIONS+="static_node=uinput"
-SUBSYSTEM=="input", MODE="0660", GROUP="input"

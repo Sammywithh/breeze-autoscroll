@@ -61,25 +61,32 @@ chmod +x "${DESKTOP_DIR}/breeze-autoscroll.desktop"
 cp "${SCRIPT_DIR}/breeze-autoscroll.service" "${SYSTEMD_USER_DIR}/breeze-autoscroll.service"
 systemctl --user daemon-reload 2>/dev/null || true
 
-# 5. Configure uinput Permissions (udev)
-echo "[5/5] Konfiguriere Eingabeberechtigungen (uinput / input-Gruppe)..."
-if [ -f "${SCRIPT_DIR}/udev/99-uinput-autoscroll.rules" ]; then
-    if cmp -s "${SCRIPT_DIR}/udev/99-uinput-autoscroll.rules" /etc/udev/rules.d/99-uinput-autoscroll.rules 2>/dev/null \
-        && id -nG "${USER}" 2>/dev/null | grep -qw "input"; then
-        echo "✓ udev-Regel und 'input'-Gruppenrechte sind bereits eingerichtet."
+# 5. Configure uinput & Mouse Permissions (udev uaccess - Least Privilege)
+echo "[5/5] Konfiguriere Least-Privilege Eingabeberechtigungen (udev uaccess)..."
+UDEV_RULE_SRC="${SCRIPT_DIR}/udev/70-uinput-autoscroll.rules"
+UDEV_RULE_DST="/etc/udev/rules.d/70-uinput-autoscroll.rules"
+LEGACY_UDEV_RULE="/etc/udev/rules.d/99-uinput-autoscroll.rules"
+if [ -f "${UDEV_RULE_SRC}" ]; then
+    if cmp -s "${UDEV_RULE_SRC}" "${UDEV_RULE_DST}" 2>/dev/null \
+        && [ ! -e "${LEGACY_UDEV_RULE}" ]; then
+        echo "✓ Gehärtete udev-Regel (uaccess) ist bereits eingerichtet."
     elif command -v sudo &>/dev/null && [ "$EUID" -ne 0 ] && { [ -t 0 ] || sudo -n true 2>/dev/null; }; then
-        echo "Richte udev-Regel für /dev/uinput ein..."
-        sudo cp "${SCRIPT_DIR}/udev/99-uinput-autoscroll.rules" /etc/udev/rules.d/ 2>/dev/null || true
-        sudo udevadm control --reload-rules 2>/dev/null || true
-        sudo udevadm trigger 2>/dev/null || true
-        sudo usermod -a -G input "${USER}" 2>/dev/null || true
+        echo "Richte gehärtete udev-Regel (TAG+=\"uaccess\") für /dev/uinput und Mausgeräte ein..."
+        sudo rm -f "${LEGACY_UDEV_RULE}" 2>/dev/null || true
+        sudo install -m 644 "${UDEV_RULE_SRC}" "${UDEV_RULE_DST}" 2>/dev/null || true
         sudo modprobe uinput 2>/dev/null || true
+        sudo udevadm control --reload-rules 2>/dev/null || true
+        sudo udevadm trigger --subsystem-match=misc --sysname-match=uinput 2>/dev/null || true
+        sudo udevadm trigger --subsystem-match=input --property-match=ID_INPUT_MOUSE=1 2>/dev/null || true
     else
-        echo "Hinweis zur Berechtigung:"
-        echo "  Um ohne Root-Rechte auf /dev/uinput zuzugreifen, führe einmalig aus:"
-        echo "  sudo cp ${SCRIPT_DIR}/udev/99-uinput-autoscroll.rules /etc/udev/rules.d/"
-        echo "  sudo usermod -a -G input \${USER}"
-        echo "  sudo udevadm control --reload-rules && sudo udevadm trigger"
+        echo "Hinweis zur Least-Privilege-Berechtigung (kein automatisches 'input'-Gruppen-Opt-in):"
+        echo "  Führe einmalig aus, um der aktiven lokalen Desktop-Sitzung Zugriff via uaccess zu geben:"
+        echo "  sudo rm -f ${LEGACY_UDEV_RULE}"
+        echo "  sudo install -m 644 ${UDEV_RULE_SRC} ${UDEV_RULE_DST}"
+        echo "  sudo modprobe uinput"
+        echo "  sudo udevadm control --reload-rules"
+        echo "  sudo udevadm trigger --subsystem-match=misc --sysname-match=uinput"
+        echo "  sudo udevadm trigger --subsystem-match=input --property-match=ID_INPUT_MOUSE=1"
     fi
 fi
 

@@ -1,0 +1,20 @@
+# ==============================================================================
+# Breeze Autoscroll - Least-privilege udev rules (active local session only)
+# ==============================================================================
+# Priority 70 runs after 60-input-id.rules (which sets ID_INPUT_MOUSE /
+# ID_INPUT_KEYBOARD) and before 73-seat-late.rules (which applies TAG+="uaccess"
+# as a per-seat ACL for the active local desktop session).
+#
+# 1. Grant only the active local session access to /dev/uinput (root:root 0600 + uaccess ACL).
+KERNEL=="uinput", SUBSYSTEM=="misc", MODE="0600", TAG+="uaccess", OPTIONS+="static_node=uinput"
+
+# 2. Grant only the active local session access to pure mouse event devices.
+#    Keyboards (ID_INPUT_KEYBOARD=="1") are explicitly excluded to prevent
+#    unprivileged keylogging exposure.
+SUBSYSTEM=="input", KERNEL=="event[0-9]*", ENV{ID_INPUT_MOUSE}=="1", ENV{ID_INPUT_KEYBOARD}!="1", TAG+="uaccess"
+
+# Optional separate least-privilege fallback (NOT enabled by default):
+# If your pointing device is not tagged ID_INPUT_MOUSE=1 or you explicitly want
+# raw evdev ESC-to-cancel while autoscroll is active on Wayland, you can either
+# add a targeted VID/PID uaccess rule for that mouse or manually opt a single
+# user into the 'input' group:  sudo usermod -aG input <username>

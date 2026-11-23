@@ -4,6 +4,7 @@
 # ==============================================================================
 
 set -e
+umask 022
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "${SCRIPT_DIR}"
@@ -51,9 +52,9 @@ chmod 644 "${BUILD_DIR}/usr/share/applications/breeze-autoscroll.desktop"
 sed -e "s|%h/.local/bin/breeze-autoscroll|/usr/bin/${PKG_NAME}|g" breeze-autoscroll.service > "${BUILD_DIR}/usr/lib/systemd/user/breeze-autoscroll.service"
 chmod 644 "${BUILD_DIR}/usr/lib/systemd/user/breeze-autoscroll.service"
 
-# Udev Rules für evdev/uinput
-cp udev/99-uinput-autoscroll.rules "${BUILD_DIR}/etc/udev/rules.d/"
-chmod 644 "${BUILD_DIR}/etc/udev/rules.d/99-uinput-autoscroll.rules"
+# Udev Rules für evdev/uinput (Least Privilege via uaccess, Priorität 70 vor 73-seat-late.rules)
+cp udev/70-uinput-autoscroll.rules "${BUILD_DIR}/etc/udev/rules.d/"
+chmod 644 "${BUILD_DIR}/etc/udev/rules.d/70-uinput-autoscroll.rules"
 
 # DEBIAN/control - Paketmetadaten und Abhängigkeiten
 cat << EOF > "${BUILD_DIR}/DEBIAN/control"
@@ -70,30 +71,34 @@ Description: Windows-style middle-click autoscroll for Kubuntu 26.04 (KDE Plasma
  Onshape, Bambu Studio, FreeCAD, Blender, and a native KDE Breeze UI.
 EOF
 
-# DEBIAN/postinst - Post-Installations-Skript
+# DEBIAN/postinst - Post-Installations-Skript (Least Privilege: kein globales usermod -aG input)
 cat << 'EOF' > "${BUILD_DIR}/DEBIAN/postinst"
 #!/usr/bin/env bash
 set -e
+umask 022
 
 if [ "$1" = "configure" ]; then
-    echo "Lade udev-Regeln neu..."
-    udevadm control --reload-rules || true
-    udevadm trigger || true
+    echo "Entferne veraltete udev-Regel (falls vorhanden)..."
+    rm -f /etc/udev/rules.d/99-uinput-autoscroll.rules || true
 
     echo "Stelle sicher, dass Kernel-Modul uinput geladen ist..."
     modprobe uinput || true
     echo "uinput" > /etc/modules-load.d/breeze-autoscroll-uinput.conf
 
-    echo "Füge Standard-Nutzer zur Gruppe 'input' hinzu..."
-    for user in $(awk -F: '$3 >= 1000 && $3 < 60000 {print $1}' /etc/passwd); do
-        usermod -a -G input "$user" 2>/dev/null || true
-    done
+    echo "Lade gehärtete udev-Regeln (uaccess) neu..."
+    udevadm control --reload-rules || true
+    udevadm trigger --subsystem-match=misc --sysname-match=uinput || true
+    udevadm trigger --subsystem-match=input --property-match=ID_INPUT_MOUSE=1 || true
 
     echo "======================================================================="
-    echo "Breeze Autoscroll wurde erfolgreich installiert!"
-    echo "HINWEIS: Da Nutzergruppen geändert wurden (input), müssen Sie sich"
-    echo "         einmal aus- und wieder einloggen (Relogin) oder den PC neu starten,"
-    echo "         damit das Programm Ihre Mauseingaben lesen darf."
+    echo "Breeze Autoscroll wurde erfolgreich installiert (Least-Privilege uaccess)!"
+    echo "Die aktive lokale Desktop-Sitzung erhält automatisch Zugriff auf"
+    echo "/dev/uinput und reine Maus-Geräte (ohne globale 'input'-Gruppe)."
+    echo ""
+    echo "Optionaler Hinweis: Falls für spezielle Eingabegeräte oder ESC-Abbruch"
+    echo "über evdev explizit Tastatur-Lesezugriff gewünscht ist, kann ein"
+    echo "einzelner Nutzer manuell hinzugefügt werden:"
+    echo "  sudo usermod -aG input <benutzername>"
     echo "======================================================================="
 fi
 exit 0
@@ -104,10 +109,14 @@ chmod 755 "${BUILD_DIR}/DEBIAN/postinst"
 cat << 'EOF' > "${BUILD_DIR}/DEBIAN/postrm"
 #!/usr/bin/env bash
 set -e
+umask 022
 
 if [ "$1" = "remove" ] || [ "$1" = "purge" ]; then
     rm -f /etc/modules-load.d/breeze-autoscroll-uinput.conf
+    rm -f /etc/udev/rules.d/99-uinput-autoscroll.rules || true
     udevadm control --reload-rules || true
+    udevadm trigger --subsystem-match=misc --sysname-match=uinput || true
+    udevadm trigger --subsystem-match=input --property-match=ID_INPUT_MOUSE=1 || true
     systemctl --global daemon-reload || true
 fi
 exit 0

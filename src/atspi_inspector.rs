@@ -1,20 +1,35 @@
 //! AT-SPI2 Accessibility hit-testing for native Linux desktop apps (Qt6/KDE Dolphin,
 //! Konsole, Kate, Okular, GTK/Nautilus/Thunar, etc.).
 //!
-//! Runs on a dedicated background worker thread with a persistent D-Bus connection to the
-//! AT-SPI2 accessibility bus so middle-click hit-testing has a strict bounded latency
-//! (`<= 45 ms`) and never blocks the input engine or session D-Bus server.
+//! Runs on a dedicated background worker thread with:
+//! - Opt-in global enablement (`auto_enable_atspi`, default `false`): by default only queries
+//!   AT-SPI2 when accessibility is already active in the desktop session, reacting dynamically
+//!   to runtime config changes.
+//! - Bounded `PidCache` (capacity + TTL) so stale PIDs cannot accumulate unboundedly.
+//! - Real per-call async D-Bus timeouts (`connection::Builder::method_timeout`) plus a strict
+//!   per-request total deadline so hung applications can never wedge the worker thread.
+//! - Bounded `sync_channel` queues with non-blocking `try_send`.
 
 use std::collections::HashMap;
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use zbus::wire::{OwnedObjectPath, OwnedVariant, Variant};
 use zbus::{Connection, Proxy, connection};
 
+use crate::config::ConfigManager;
+
 const ATSPI_QUERY_TIMEOUT_MS: u64 = 45;
+const ATSPI_CALL_TIMEOUT_MS: u64 = 35;
+const ATSPI_SESSION_TIMEOUT_MS: u64 = 150;
+const ATSPI_STATUS_RECHECK_INTERVAL: Duration = Duration::from_secs(2);
+const MAX_PID_CACHE_ENTRIES: usize = 256;
+const PID_CACHE_TTL: Duration = Duration::from_secs(60);
+const MAX_REGISTRY_CHILDREN_SCAN: usize = 128;
+const WORKER_CHANNEL_CAPACITY: usize = 8;
+
 const ATSPI_NULL_PATH: &str = "/org/a11y/atspi/null";
 const ATSPI_ROOT_PATH: &str = "/org/a11y/atspi/accessible/root";
 const ATSPI_COORD_SCREEN: u32 = 0;
@@ -29,6 +44,70 @@ pub struct AtSpiHitResult {
     pub is_interactive: bool,
 }
 
+/// Bounded PID -> AT-SPI2 bus-name cache with capacity limit and entry TTL.
+#[derive(Debug)]
+struct PidCache {
+    entries: HashMap<u32, (String, Instant)>,
+    max_entries: usize,
+    ttl: Duration,
+}
+
+impl PidCache {
+    fn new(max_entries: usize, ttl: Duration) -> Self {
+        Self {
+            entries: HashMap::with_capacity(max_entries.min(64)),
+            max_entries: max_entries.max(1),
+            ttl,
+        }
+    }
+
+    fn get(&mut self, pid: u32, now: Instant) -> Option<String> {
+        let is_expired = self
+            .entries
+            .get(&pid)
+            .is_some_and(|(_, inserted_at)| now.saturating_duration_since(*inserted_at) >= self.ttl);
+        if is_expired {
+            self.entries.remove(&pid);
+            return None;
+        }
+        self.entries.get(&pid).map(|(name, _)| name.clone())
+    }
+
+    fn insert(&mut self, pid: u32, bus_name: String, now: Instant) {
+        self.purge_expired(now);
+        if !self.entries.contains_key(&pid) && self.entries.len() >= self.max_entries {
+            if let Some(oldest_pid) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, (_, ts))| *ts)
+                .map(|(&k, _)| k)
+            {
+                self.entries.remove(&oldest_pid);
+            }
+        }
+        self.entries.insert(pid, (bus_name, now));
+    }
+
+    fn remove(&mut self, pid: u32) {
+        self.entries.remove(&pid);
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+    }
+
+    fn purge_expired(&mut self, now: Instant) {
+        let ttl = self.ttl;
+        self.entries
+            .retain(|_, (_, inserted_at)| now.saturating_duration_since(*inserted_at) < ttl);
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
 struct QueryRequest {
     pid: u32,
     window_title: String,
@@ -38,16 +117,17 @@ struct QueryRequest {
     screen_y: i32,
     win_w: i32,
     win_h: i32,
-    reply_tx: Sender<Option<AtSpiHitResult>>,
+    reply_tx: SyncSender<Option<AtSpiHitResult>>,
 }
 
 enum WorkerCmd {
     Query(QueryRequest),
+    SyncConfig,
     Shutdown,
 }
 
 struct WorkerHandle {
-    tx: Sender<WorkerCmd>,
+    tx: SyncSender<WorkerCmd>,
     join: Option<JoinHandle<()>>,
 }
 
@@ -62,20 +142,30 @@ impl AtSpiInspector {
         Self::default()
     }
 
-    /// Starts the persistent AT-SPI2 worker thread and warms up the accessibility bus connection.
-    pub fn start(&self) {
+    /// Starts the persistent AT-SPI2 worker thread observing live `ConfigManager` opt-in state.
+    pub fn start(&self, config: ConfigManager) {
         let Ok(mut guard) = self.worker.lock() else {
             return;
         };
         if guard.is_some() {
             return;
         }
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = mpsc::sync_channel(WORKER_CHANNEL_CAPACITY);
         let join = thread::Builder::new()
             .name("breeze-atspi-worker".to_string())
-            .spawn(move || run_atspi_worker(rx))
+            .spawn(move || run_atspi_worker(rx, config))
             .ok();
         *guard = Some(WorkerHandle { tx, join });
+    }
+
+    /// Prompts the worker to re-evaluate `config.current().auto_enable_atspi` immediately
+    /// (e.g. after `ReloadConfig`).
+    pub fn sync_config(&self) {
+        if let Ok(guard) = self.worker.lock()
+            && let Some(handle) = guard.as_ref()
+        {
+            let _ = handle.tx.try_send(WorkerCmd::SyncConfig);
+        }
     }
 
     /// Stops the AT-SPI2 worker thread and restores `org.a11y.Status.IsEnabled` if we enabled it.
@@ -86,7 +176,9 @@ impl AtSpiInspector {
             None
         };
         if let Some(mut h) = handle {
-            let _ = h.tx.send(WorkerCmd::Shutdown);
+            if h.tx.try_send(WorkerCmd::Shutdown).is_err() {
+                let _ = h.tx.send(WorkerCmd::Shutdown);
+            }
             if let Some(j) = h.join.take() {
                 let _ = j.join();
             }
@@ -114,8 +206,8 @@ impl AtSpiInspector {
             let guard = self.worker.lock().ok()?;
             guard.as_ref()?.tx.clone()
         };
-        let (reply_tx, reply_rx) = mpsc::channel();
-        tx.send(WorkerCmd::Query(QueryRequest {
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        tx.try_send(WorkerCmd::Query(QueryRequest {
             pid,
             window_title: window_title.to_string(),
             rel_x,
@@ -198,77 +290,152 @@ fn is_item_container_role(role: &str) -> bool {
     )
 }
 
-fn run_atspi_worker(rx: Receiver<WorkerCmd>) {
-    zbus::block_on(async move {
-        let mut session_conn = Connection::session().await.ok();
-        let mut enabled_by_us = false;
-        let mut a11y_conn: Option<Connection> = None;
-        let mut pid_cache: HashMap<u32, String> = HashMap::new();
+async fn connect_session_with_timeout() -> Option<Connection> {
+    connection::Builder::session()
+        .method_timeout(Duration::from_millis(ATSPI_SESSION_TIMEOUT_MS))
+        .build()
+        .await
+        .ok()
+}
 
-        if let Some(ref sconn) = session_conn {
-            enabled_by_us = ensure_atspi_enabled(sconn).await;
-            a11y_conn = connect_atspi_bus(sconn).await;
+struct WorkerState {
+    session_conn: Option<Connection>,
+    a11y_conn: Option<Connection>,
+    enabled_by_us: bool,
+    last_auto_enable: bool,
+    last_status_check: Option<Instant>,
+    pid_cache: PidCache,
+}
+
+impl WorkerState {
+    fn new(initial_auto_enable: bool) -> Self {
+        Self {
+            session_conn: None,
+            a11y_conn: None,
+            enabled_by_us: false,
+            last_auto_enable: initial_auto_enable,
+            last_status_check: None,
+            pid_cache: PidCache::new(MAX_PID_CACHE_ENTRIES, PID_CACHE_TTL),
         }
+    }
+
+    /// Synchronizes AT-SPI2 bus state with current `auto_enable_atspi` opt-in setting and
+    /// session accessibility status. Never enables `org.a11y.Status.IsEnabled` unless
+    /// `auto_enable` is explicitly `true`.
+    async fn reconcile_connection(&mut self, auto_enable: bool, force_recheck: bool) {
+        let opt_in_changed = auto_enable != self.last_auto_enable;
+        self.last_auto_enable = auto_enable;
+
+        // If user revoked opt-in at runtime and we were the ones who enabled AT-SPI2, turn it off cleanly.
+        if !auto_enable && self.enabled_by_us {
+            if self.session_conn.is_none() {
+                self.session_conn = connect_session_with_timeout().await;
+            }
+            if let Some(ref sconn) = self.session_conn {
+                let _ = set_a11y_enabled(sconn, false).await;
+            }
+            self.enabled_by_us = false;
+            self.a11y_conn = None;
+            self.pid_cache.clear();
+            self.last_status_check = Some(Instant::now());
+            return;
+        }
+
+        if self.a11y_conn.is_some() {
+            return;
+        }
+
+        let now = Instant::now();
+        if !force_recheck
+            && !opt_in_changed
+            && self
+                .last_status_check
+                .is_some_and(|ts| now.saturating_duration_since(ts) < ATSPI_STATUS_RECHECK_INTERVAL)
+        {
+            return;
+        }
+        self.last_status_check = Some(now);
+
+        if self.session_conn.is_none() {
+            self.session_conn = connect_session_with_timeout().await;
+        }
+        let Some(ref sconn) = self.session_conn else {
+            return;
+        };
+
+        let is_enabled = match get_a11y_enabled(sconn).await {
+            Some(true) => true,
+            Some(false) if auto_enable => {
+                if set_a11y_enabled(sconn, true).await {
+                    self.enabled_by_us = true;
+                    true
+                } else {
+                    false
+                }
+            }
+            _ => false,
+        };
+
+        if is_enabled {
+            self.a11y_conn = connect_atspi_bus(sconn).await;
+        }
+    }
+}
+
+fn run_atspi_worker(rx: Receiver<WorkerCmd>, config: ConfigManager) {
+    zbus::block_on(async move {
+        let initial_opt_in = config.current().auto_enable_atspi;
+        let mut state = WorkerState::new(initial_opt_in);
+        state.reconcile_connection(initial_opt_in, true).await;
 
         while let Ok(cmd) = rx.recv() {
             match cmd {
+                WorkerCmd::SyncConfig => {
+                    let opt_in = config.current().auto_enable_atspi;
+                    state.reconcile_connection(opt_in, true).await;
+                }
                 WorkerCmd::Query(req) => {
-                    if a11y_conn.is_none() {
-                        if session_conn.is_none() {
-                            session_conn = Connection::session().await.ok();
-                        }
-                        if let Some(ref sconn) = session_conn {
-                            if !enabled_by_us {
-                                enabled_by_us = ensure_atspi_enabled(sconn).await;
-                            }
-                            a11y_conn = connect_atspi_bus(sconn).await;
-                        }
-                    }
+                    let deadline = Instant::now() + Duration::from_millis(ATSPI_QUERY_TIMEOUT_MS);
+                    let opt_in = config.current().auto_enable_atspi;
+                    state.reconcile_connection(opt_in, false).await;
 
-                    let result = if let Some(ref conn) = a11y_conn {
-                        query_atspi_point(conn, &mut pid_cache, &req).await
+                    let result = if Instant::now() < deadline
+                        && let Some(ref conn) = state.a11y_conn
+                    {
+                        query_atspi_point(conn, &mut state.pid_cache, &req, deadline).await
                     } else {
                         None
                     };
-                    let _ = req.reply_tx.send(result);
+                    let _ = req.reply_tx.try_send(result);
                 }
                 WorkerCmd::Shutdown => break,
             }
         }
 
-        // Cleanly restore org.a11y.Status.IsEnabled if we enabled it at startup
-        if enabled_by_us
-            && let Some(ref sconn) = session_conn
+        // Cleanly restore org.a11y.Status.IsEnabled ONLY if we explicitly enabled it under opt-in
+        if state.enabled_by_us
+            && let Some(ref sconn) = state.session_conn
         {
             let _ = set_a11y_enabled(sconn, false).await;
         }
     });
 }
 
-async fn ensure_atspi_enabled(session_conn: &Connection) -> bool {
-    let Ok(proxy) = Proxy::new(
+async fn get_a11y_enabled(session_conn: &Connection) -> Option<bool> {
+    let proxy = Proxy::new(
         session_conn,
         "org.a11y.Bus",
         "/org/a11y/bus",
         "org.freedesktop.DBus.Properties",
     )
     .await
-    else {
-        return false;
-    };
+    .ok()?;
 
-    let already_enabled = proxy
+    proxy
         .call::<_, _, OwnedVariant>("Get", &("org.a11y.Status", "IsEnabled"))
         .await
         .ok()
         .and_then(|v| bool::try_from(&v).ok())
-        .unwrap_or(false);
-
-    if already_enabled {
-        return false;
-    }
-
-    set_a11y_enabled(session_conn, true).await
 }
 
 async fn set_a11y_enabled(session_conn: &Connection, enabled: bool) -> bool {
@@ -301,6 +468,7 @@ async fn connect_atspi_bus(session_conn: &Connection) -> Option<Connection> {
         return None;
     }
     connection::Builder::address(addr.as_str())
+        .method_timeout(Duration::from_millis(ATSPI_CALL_TIMEOUT_MS))
         .build()
         .await
         .ok()
@@ -308,31 +476,44 @@ async fn connect_atspi_bus(session_conn: &Connection) -> Option<Connection> {
 
 async fn query_atspi_point(
     conn: &Connection,
-    pid_cache: &mut HashMap<u32, String>,
+    pid_cache: &mut PidCache,
     req: &QueryRequest,
+    deadline: Instant,
 ) -> Option<AtSpiHitResult> {
-    let bus_name = resolve_pid_bus_name(conn, pid_cache, req.pid).await?;
-    let frame_path = match find_target_frame(conn, &bus_name, req).await {
-        Some(path) => path,
-        None => {
-            // Cached bus name may belong to a restarted process; refresh once
-            pid_cache.remove(&req.pid);
-            let refreshed = resolve_pid_bus_name(conn, pid_cache, req.pid).await?;
-            find_target_frame(conn, &refreshed, req).await?
-        }
-    };
+    if Instant::now() >= deadline {
+        return None;
+    }
+    let bus_name = resolve_pid_bus_name(conn, pid_cache, req.pid, deadline).await?;
+    let (active_bus_name, frame_path) =
+        match find_target_frame(conn, &bus_name, req, deadline).await {
+            Some(path) => (bus_name, path),
+            None => {
+                if Instant::now() >= deadline {
+                    return None;
+                }
+                // Cached bus name may belong to a restarted process; refresh once
+                pid_cache.remove(req.pid);
+                let refreshed = resolve_pid_bus_name(conn, pid_cache, req.pid, deadline).await?;
+                let path = find_target_frame(conn, &refreshed, req, deadline).await?;
+                (refreshed, path)
+            }
+        };
 
-    let bus_name = pid_cache.get(&req.pid)?.clone();
-    hit_test_tree(conn, &bus_name, &frame_path, req).await
+    hit_test_tree(conn, &active_bus_name, &frame_path, req, deadline).await
 }
 
 async fn resolve_pid_bus_name(
     conn: &Connection,
-    pid_cache: &mut HashMap<u32, String>,
+    pid_cache: &mut PidCache,
     target_pid: u32,
+    deadline: Instant,
 ) -> Option<String> {
-    if let Some(cached) = pid_cache.get(&target_pid) {
-        return Some(cached.clone());
+    let now = Instant::now();
+    if let Some(cached) = pid_cache.get(target_pid, now) {
+        return Some(cached);
+    }
+    if now >= deadline {
+        return None;
     }
 
     let reg = Proxy::new(
@@ -354,8 +535,11 @@ async fn resolve_pid_bus_name(
     .await
     .ok()?;
 
-    pid_cache.clear();
-    for (sender, _) in children {
+    let mut found: Option<String> = None;
+    for (sender, _) in children.into_iter().take(MAX_REGISTRY_CHILDREN_SCAN) {
+        if Instant::now() >= deadline {
+            break;
+        }
         if sender.is_empty() {
             continue;
         }
@@ -363,18 +547,29 @@ async fn resolve_pid_bus_name(
             .call::<_, _, u32>("GetConnectionUnixProcessID", &(&sender,))
             .await
         {
-            pid_cache.insert(pid, sender);
+            let ts = Instant::now();
+            if pid == target_pid {
+                found = Some(sender.clone());
+            }
+            pid_cache.insert(pid, sender, ts);
+            if found.is_some() {
+                break;
+            }
         }
     }
 
-    pid_cache.get(&target_pid).cloned()
+    found.or_else(|| pid_cache.get(target_pid, Instant::now()))
 }
 
 async fn find_target_frame(
     conn: &Connection,
     bus_name: &str,
     req: &QueryRequest,
+    deadline: Instant,
 ) -> Option<String> {
+    if Instant::now() >= deadline {
+        return None;
+    }
     let root = Proxy::new(
         conn,
         bus_name,
@@ -388,6 +583,7 @@ async fn find_target_frame(
         .into_iter()
         .map(|(_, p)| p.as_str().to_string())
         .filter(|p| !p.is_empty() && p != ATSPI_NULL_PATH)
+        .take(32)
         .collect();
 
     if valid_paths.is_empty() {
@@ -402,6 +598,9 @@ async fn find_target_frame(
     let mut best_geom_match: Option<(i32, String)> = None;
 
     for path in &valid_paths {
+        if Instant::now() >= deadline {
+            break;
+        }
         if !title_lower.is_empty()
             && let Some(name) = get_accessible_name(conn, bus_name, path).await
         {
@@ -411,6 +610,9 @@ async fn find_target_frame(
             {
                 return Some(path.clone());
             }
+        }
+        if Instant::now() >= deadline {
+            break;
         }
         if let Some((_, _, ew, eh)) = get_extents(conn, bus_name, path, ATSPI_COORD_WINDOW).await {
             let diff = (ew - req.win_w).abs() + (eh - req.win_h).abs();
@@ -433,11 +635,15 @@ async fn hit_test_tree(
     bus_name: &str,
     frame_path: &str,
     req: &QueryRequest,
+    deadline: Instant,
 ) -> Option<AtSpiHitResult> {
     let mut curr_path = frame_path.to_string();
     let mut last_role: Option<String> = None;
 
     for _depth in 0..8 {
+        if Instant::now() >= deadline {
+            break;
+        }
         let mut next_path = get_accessible_at_point(
             conn,
             bus_name,
@@ -452,6 +658,7 @@ async fn hit_test_tree(
         // KItemListViewAccessible), query with container-local coordinates and verify the
         // returned item's bounding box contains the clicked pointer.
         if next_path.is_none()
+            && Instant::now() < deadline
             && last_role
                 .as_deref()
                 .is_some_and(is_item_container_role)
@@ -462,16 +669,18 @@ async fn hit_test_tree(
         {
             let local_x = req.rel_x - lx;
             let local_y = req.rel_y - ly;
-            if let Some(candidate) = get_accessible_at_point(
-                conn,
-                bus_name,
-                &curr_path,
-                local_x,
-                local_y,
-                ATSPI_COORD_SCREEN,
-            )
-            .await
+            if Instant::now() < deadline
+                && let Some(candidate) = get_accessible_at_point(
+                    conn,
+                    bus_name,
+                    &curr_path,
+                    local_x,
+                    local_y,
+                    ATSPI_COORD_SCREEN,
+                )
+                .await
                 && candidate != curr_path
+                && Instant::now() < deadline
                 && let Some(ext) =
                     get_extents(conn, bus_name, &candidate, ATSPI_COORD_WINDOW).await
                 && rect_contains_point(ext, req.rel_x, req.rel_y, 4)
@@ -482,6 +691,7 @@ async fn hit_test_tree(
 
         // Also try SCREEN coordinates on the frame root if WINDOW coords returned null (GTK/X11)
         if next_path.is_none()
+            && Instant::now() < deadline
             && curr_path == frame_path
             && let Some(candidate) = get_accessible_at_point(
                 conn,
@@ -500,7 +710,7 @@ async fn hit_test_tree(
         let Some(child_path) = next_path else {
             break;
         };
-        if child_path == curr_path {
+        if child_path == curr_path || Instant::now() >= deadline {
             break;
         }
 
@@ -587,7 +797,6 @@ mod tests {
 
     #[test]
     fn classifies_dolphin_and_desktop_interactive_vs_scrollable_roles() {
-        // Dolphin folders/files, tabs, places sidebar, toolbar buttons, menus, links
         for role in [
             "page tab",
             "page tab list",
@@ -611,7 +820,6 @@ mod tests {
             );
         }
 
-        // Empty file-view canvas (`list` with no child), panels, text editors, terminals
         for role in [
             "list",
             "tree",
@@ -638,14 +846,36 @@ mod tests {
 
     #[test]
     fn rect_contains_point_checks_bounds_and_margin() {
-        // Dolphin folder `resources` at (361, 93, 125x88)
         let folder = (361, 93, 125, 88);
-        assert!(rect_contains_point(folder, 400, 130, 4)); // inside folder
-        assert!(rect_contains_point(folder, 361, 93, 4)); // top-left corner
-        assert!(rect_contains_point(folder, 486, 181, 4)); // bottom-right corner
-        assert!(!rect_contains_point(folder, 351, 130, 4)); // gap between locales & resources
-        assert!(!rect_contains_point(folder, 900, 500, 4)); // empty space bottom-right
-        assert!(!rect_contains_point((0, 0, 0, 0), 0, 0, 4)); // hidden zero-size widget
+        assert!(rect_contains_point(folder, 400, 130, 4));
+        assert!(rect_contains_point(folder, 361, 93, 4));
+        assert!(rect_contains_point(folder, 486, 181, 4));
+        assert!(!rect_contains_point(folder, 351, 130, 4));
+        assert!(!rect_contains_point(folder, 900, 500, 4));
+        assert!(!rect_contains_point((0, 0, 0, 0), 0, 0, 4));
+    }
+
+    #[test]
+    fn pid_cache_enforces_capacity_and_ttl_eviction() {
+        let mut cache = PidCache::new(3, Duration::from_secs(10));
+        let t0 = Instant::now();
+
+        cache.insert(101, ":1.10".to_string(), t0);
+        cache.insert(102, ":1.11".to_string(), t0 + Duration::from_secs(1));
+        cache.insert(103, ":1.12".to_string(), t0 + Duration::from_secs(2));
+        assert_eq!(cache.len(), 3);
+        assert_eq!(cache.get(101, t0 + Duration::from_secs(2)).as_deref(), Some(":1.10"));
+
+        // Inserting a 4th entry evicts the oldest (PID 101)
+        cache.insert(104, ":1.13".to_string(), t0 + Duration::from_secs(3));
+        assert_eq!(cache.len(), 3);
+        assert!(cache.get(101, t0 + Duration::from_secs(3)).is_none());
+        assert_eq!(cache.get(104, t0 + Duration::from_secs(3)).as_deref(), Some(":1.13"));
+
+        // Entries expire once TTL has elapsed
+        assert!(cache.get(102, t0 + Duration::from_secs(12)).is_none());
+        cache.purge_expired(t0 + Duration::from_secs(14));
+        assert_eq!(cache.len(), 0);
     }
 
     #[test]
@@ -658,8 +888,9 @@ mod tests {
         let pid_str = String::from_utf8_lossy(&pid_out.stdout);
         let pid: u32 = pid_str.trim().parse().expect("dolphin must be running");
 
+        let cfg = ConfigManager::try_new(None).expect("config");
         let inspector = AtSpiInspector::new();
-        inspector.start();
+        inspector.start(cfg);
         std::thread::sleep(Duration::from_millis(200));
 
         let cases = [

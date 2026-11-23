@@ -1,14 +1,15 @@
 //! Low-level Linux `evdev` mouse/keyboard listener, `uinput` virtual wheel emitter,
 //! and 3D-orbit-protected autoscroll state machine.
 
-use std::collections::HashMap;
+use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::Sender;
+use std::sync::mpsc::SyncSender;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -158,10 +159,11 @@ impl UInputEmitter {
         let file = OpenOptions::new()
             .read(true)
             .write(true)
+            .custom_flags(libc::O_CLOEXEC)
             .open(uinput_path)
             .map_err(|err| {
                 if err.kind() == io::ErrorKind::PermissionDenied {
-                    "Keine Schreibrechte auf /dev/uinput. Bitte 'install.sh' ausführen oder Benutzer zur Gruppe 'input' hinzufügen.".to_string()
+                    "Keine Schreibrechte auf /dev/uinput. Bitte 'install.sh' ausführen, um die gehärtete udev-Regel (70-uinput-autoscroll.rules mit TAG+=\"uaccess\") zu aktivieren.".to_string()
                 } else {
                     format!("Fehler beim Öffnen von /dev/uinput: {err}")
                 }
@@ -170,12 +172,18 @@ impl UInputEmitter {
         let fd = file.as_raw_fd();
 
         unsafe {
+            // Minimal capability set recognized as a pointer/wheel device by libinput/KWin:
+            // BTN_LEFT is required by udev input_id/libinput for ID_INPUT_MOUSE classification;
+            // BTN_RIGHT, BTN_MIDDLE, BTN_SIDE, BTN_EXTRA are intentionally omitted.
             ioctl_check(fd, UI_SET_EVBIT, EV_KEY as libc::c_int, "UI_SET_EVBIT(EV_KEY)")?;
             ioctl_check(fd, UI_SET_EVBIT, EV_REL as libc::c_int, "UI_SET_EVBIT(EV_REL)")?;
 
-            for btn in [BTN_LEFT, BTN_RIGHT, BTN_MIDDLE, BTN_SIDE, BTN_EXTRA] {
-                ioctl_check(fd, UI_SET_KEYBIT, btn as libc::c_int, "UI_SET_KEYBIT")?;
-            }
+            ioctl_check(
+                fd,
+                UI_SET_KEYBIT,
+                BTN_LEFT as libc::c_int,
+                "UI_SET_KEYBIT(BTN_LEFT)",
+            )?;
             for rel in [
                 REL_X,
                 REL_Y,
@@ -215,7 +223,7 @@ impl UInputEmitter {
         Ok(Self { file })
     }
 
-    fn write_event(&self, type_: u16, code: u16, value: i32) {
+    fn write_event(&self, type_: u16, code: u16, value: i32) -> io::Result<()> {
         let ev = InputEvent {
             time: libc::timeval {
                 tv_sec: 0,
@@ -225,12 +233,35 @@ impl UInputEmitter {
             code,
             value,
         };
-        let ptr = (&ev as *const InputEvent).cast::<libc::c_void>();
-        let size = std::mem::size_of::<InputEvent>();
-        unsafe {
-            let _ = libc::write(self.file.as_raw_fd(), ptr, size);
-        }
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                (&ev as *const InputEvent).cast::<u8>(),
+                std::mem::size_of::<InputEvent>(),
+            )
+        };
+        write_all_retry_eintr(self.file.as_raw_fd(), bytes)
     }
+}
+
+fn write_all_retry_eintr(fd: RawFd, mut buf: &[u8]) -> io::Result<()> {
+    while !buf.is_empty() {
+        let written = unsafe { libc::write(fd, buf.as_ptr().cast::<libc::c_void>(), buf.len()) };
+        if written < 0 {
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(err);
+        }
+        if written == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "uinput write returned 0 bytes",
+            ));
+        }
+        buf = &buf[written as usize..];
+    }
+    Ok(())
 }
 
 impl Drop for UInputEmitter {
@@ -252,13 +283,21 @@ impl WheelEmitter for UInputEmitter {
             (REL_HWHEEL, REL_HWHEEL_HI_RES)
         };
 
-        if std_delta != 0 {
-            self.write_event(EV_REL, std_code, std_delta);
+        if std_delta != 0
+            && let Err(err) = self.write_event(EV_REL, std_code, std_delta)
+        {
+            eprintln!("[InputManager] Fehler beim Schreiben von REL_WHEEL/HWHEEL: {err}");
+            return;
         }
-        if hires_delta != 0 {
-            self.write_event(EV_REL, hires_code, hires_delta);
+        if hires_delta != 0
+            && let Err(err) = self.write_event(EV_REL, hires_code, hires_delta)
+        {
+            eprintln!("[InputManager] Fehler beim Schreiben von HI_RES Wheel: {err}");
+            return;
         }
-        self.write_event(EV_SYN, SYN_REPORT, 0);
+        if let Err(err) = self.write_event(EV_SYN, SYN_REPORT, 0) {
+            eprintln!("[InputManager] Fehler beim Schreiben von SYN_REPORT: {err}");
+        }
     }
 }
 
@@ -712,6 +751,7 @@ impl ScrollStateMachine {
     }
 
     /// Advances timers and emits smooth hi-res scroll wheel ticks using 2D vector physics.
+    #[cfg(test)]
     pub fn tick<E: WheelEmitter>(
         &mut self,
         now: Instant,
@@ -719,12 +759,25 @@ impl ScrollStateMachine {
         emitter: &mut E,
     ) -> Vec<IndicatorCommand> {
         let mut commands = Vec::new();
+        self.tick_into(now, config, emitter, &mut commands);
+        commands
+    }
+
+    /// Allocation-free variant of `tick` that writes emitted indicator commands into `commands`.
+    pub fn tick_into<E: WheelEmitter>(
+        &mut self,
+        now: Instant,
+        config: &ConfigData,
+        emitter: &mut E,
+        commands: &mut Vec<IndicatorCommand>,
+    ) {
+        commands.clear();
 
         if !config.enabled {
             if let Some(cmd) = self.force_stop() {
                 commands.push(cmd);
             }
-            return commands;
+            return;
         }
 
         // System-wide short-click protection (`short_click_passthrough`) and optional `protect_3d_drag`:
@@ -751,7 +804,7 @@ impl ScrollStateMachine {
                 let dist = move_x.hypot(move_y);
                 if config.protect_3d_drag && dist >= config.drag_cancel_threshold_px {
                     self.phase = ScrollPhase::Idle;
-                    return commands;
+                    return;
                 }
 
                 self.phase = ScrollPhase::Active {
@@ -780,10 +833,10 @@ impl ScrollStateMachine {
                     allow_horizontal: config.allow_horizontal,
                 });
                 if !early_drag_activate {
-                    return commands;
+                    return;
                 }
             } else {
-                return commands;
+                return;
             }
         }
 
@@ -864,8 +917,6 @@ impl ScrollStateMachine {
                 }
             }
         }
-
-        commands
     }
 }
 
@@ -927,7 +978,7 @@ pub fn calc_scroll_rate(effective_dist: f32, speed_mult: f32, curve_exponent: f3
 }
 
 // ============================================================================
-// evdev Device Discovery & Background Input Thread
+// evdev Device Discovery, inotify Hotplug & Background Input Thread
 // ============================================================================
 
 struct EvdevDevice {
@@ -937,12 +988,10 @@ struct EvdevDevice {
     has_esc: bool,
 }
 
-fn find_input_devices() -> Vec<EvdevDevice> {
-    let mut result = Vec::new();
+fn list_event_paths() -> Vec<PathBuf> {
     let Ok(entries) = fs::read_dir("/dev/input") else {
-        return result;
+        return Vec::new();
     };
-
     let mut paths: Vec<PathBuf> = entries
         .filter_map(|e| e.ok().map(|entry| entry.path()))
         .filter(|p| {
@@ -952,39 +1001,210 @@ fn find_input_devices() -> Vec<EvdevDevice> {
         })
         .collect();
     paths.sort();
+    paths
+}
 
-    for path in paths {
-        let Ok(file) = OpenOptions::new().read(true).open(&path) else {
+fn open_evdev_nonblock(path: &Path) -> Option<File> {
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)
+        .ok()
+}
+
+/// Discovers and opens ONLY mouse devices (`device_is_mouse`).
+/// Keyboard devices are never opened during Idle/Pending.
+fn find_mouse_devices() -> Vec<EvdevDevice> {
+    let mut result = Vec::new();
+    for path in list_event_paths() {
+        let Some(file) = open_evdev_nonblock(&path) else {
             continue;
         };
         let fd = file.as_raw_fd();
-
-        // Set non-blocking mode for select/poll-free drain reads
-        unsafe {
-            let flags = libc::fcntl(fd, libc::F_GETFL);
-            if flags >= 0 {
-                libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
-            }
-        }
 
         let name = read_device_name(fd);
         if name.contains("Breeze Autoscroll") {
             continue;
         }
 
-        let is_mouse = device_is_mouse(fd);
-        let has_esc = device_has_key(fd, KEY_ESC);
-        if is_mouse || has_esc {
+        if device_is_mouse(fd) {
+            let has_esc = device_has_key(fd, KEY_ESC);
             result.push(EvdevDevice {
                 path,
                 file,
-                is_mouse,
+                is_mouse: true,
                 has_esc,
             });
         }
     }
-
     result
+}
+
+/// Incrementally refreshes open mouse devices without closing/reopening unchanged FDs.
+fn refresh_mouse_devices(devices: &mut Vec<EvdevDevice>, bad_paths: &HashSet<PathBuf>) {
+    let current_paths = list_event_paths();
+    let present: HashSet<&Path> = current_paths.iter().map(PathBuf::as_path).collect();
+
+    // Retain already-open healthy devices that still exist
+    devices.retain(|dev| {
+        present.contains(dev.path.as_path()) && !bad_paths.contains(&dev.path)
+    });
+
+    let already_open: HashSet<PathBuf> = devices.iter().map(|d| d.path.clone()).collect();
+    for path in current_paths {
+        if already_open.contains(&path) {
+            continue;
+        }
+        let Some(file) = open_evdev_nonblock(&path) else {
+            continue;
+        };
+        let fd = file.as_raw_fd();
+        let name = read_device_name(fd);
+        if name.contains("Breeze Autoscroll") {
+            continue;
+        }
+        if device_is_mouse(fd) {
+            let has_esc = device_has_key(fd, KEY_ESC);
+            devices.push(EvdevDevice {
+                path,
+                file,
+                is_mouse: true,
+                has_esc,
+            });
+        }
+    }
+}
+
+/// Opens keyboard devices (`KEY_ESC`) strictly on-demand while autoscroll is `Active`.
+/// Gracefully skips unreadable nodes (e.g. `EACCES` under least-privilege `uaccess` rules).
+fn find_esc_keyboard_devices(mouse_devices: &[EvdevDevice]) -> Vec<EvdevDevice> {
+    let already_open: HashSet<&Path> = mouse_devices.iter().map(|d| d.path.as_path()).collect();
+    let mut result = Vec::new();
+    for path in list_event_paths() {
+        if already_open.contains(path.as_path()) {
+            continue;
+        }
+        let Some(file) = open_evdev_nonblock(&path) else {
+            continue;
+        };
+        let fd = file.as_raw_fd();
+        let name = read_device_name(fd);
+        if name.contains("Breeze Autoscroll") {
+            continue;
+        }
+        if device_has_key(fd, KEY_ESC) {
+            result.push(EvdevDevice {
+                path,
+                file,
+                is_mouse: false,
+                has_esc: true,
+            });
+        }
+    }
+    result
+}
+
+struct InotifyWatcher {
+    file: File,
+}
+
+impl InotifyWatcher {
+    fn new_dev_input() -> Option<Self> {
+        let fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
+        if fd < 0 {
+            return None;
+        }
+        let file = unsafe { File::from_raw_fd(fd) };
+        let mask = libc::IN_CREATE | libc::IN_DELETE | libc::IN_ATTRIB;
+        let wd = unsafe { libc::inotify_add_watch(file.as_raw_fd(), c"/dev/input".as_ptr(), mask) };
+        if wd < 0 {
+            return None;
+        }
+        Some(Self { file })
+    }
+
+    fn as_raw_fd(&self) -> RawFd {
+        self.file.as_raw_fd()
+    }
+
+    /// Drains all pending inotify events and returns true when an `event*` node changed
+    /// (or the inotify queue overflowed).
+    fn drain_and_check_rescan(&self) -> bool {
+        let mut buf = [0u8; 4096];
+        let mut should_rescan = false;
+        loop {
+            let n = unsafe {
+                libc::read(
+                    self.file.as_raw_fd(),
+                    buf.as_mut_ptr().cast::<libc::c_void>(),
+                    buf.len(),
+                )
+            };
+            if n < 0 {
+                let err = io::Error::last_os_error();
+                if err.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                break;
+            }
+            if n == 0 {
+                break;
+            }
+            if parse_inotify_buffer(&buf[..n as usize]) {
+                should_rescan = true;
+            }
+        }
+        should_rescan
+    }
+}
+
+/// Parses raw `inotify_event` bytes and returns true if any event refers to an `event*`
+/// device node or signals `IN_Q_OVERFLOW`.
+fn parse_inotify_buffer(bytes: &[u8]) -> bool {
+    let hdr_size = std::mem::size_of::<libc::inotify_event>();
+    let mut offset = 0usize;
+    let mut rescan = false;
+
+    while offset + hdr_size <= bytes.len() {
+        let ev = unsafe {
+            std::ptr::read_unaligned(bytes[offset..].as_ptr().cast::<libc::inotify_event>())
+        };
+        let name_len = ev.len as usize;
+        let step = hdr_size.saturating_add(name_len);
+        if step == 0 || offset + step > bytes.len() {
+            rescan = true;
+            break;
+        }
+
+        if (ev.mask & libc::IN_Q_OVERFLOW) != 0 {
+            rescan = true;
+        } else if name_len > 0 {
+            let name_bytes = &bytes[offset + hdr_size..offset + step];
+            let nul_pos = name_bytes
+                .iter()
+                .position(|&b| b == 0)
+                .unwrap_or(name_bytes.len());
+            if let Ok(name) = std::str::from_utf8(&name_bytes[..nul_pos])
+                && name.starts_with("event")
+            {
+                rescan = true;
+            }
+        }
+
+        offset += step;
+    }
+
+    rescan
+}
+
+fn create_cloexec_nonblock_pipe() -> io::Result<(File, File)> {
+    let mut pipe_fds = [-1i32; 2];
+    if unsafe { libc::pipe2(pipe_fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let read_file = unsafe { File::from_raw_fd(pipe_fds[0]) };
+    let write_file = unsafe { File::from_raw_fd(pipe_fds[1]) };
+    Ok((read_file, write_file))
 }
 
 fn read_device_name(fd: RawFd) -> String {
@@ -1037,7 +1257,7 @@ fn device_has_key(fd: RawFd, key_code: u16) -> bool {
 pub struct InputEngine {
     running: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
-    wake_write_fd: RawFd,
+    wake_write: Option<File>,
 }
 
 impl InputEngine {
@@ -1045,17 +1265,13 @@ impl InputEngine {
     pub fn start(
         config: ConfigManager,
         window_tracker: WindowTracker,
-        indicator_tx: Sender<IndicatorCommand>,
+        indicator_tx: SyncSender<IndicatorCommand>,
     ) -> Result<Self, String> {
         let mut emitter = UInputEmitter::create()?;
 
-        // Self-pipe to wake up `poll` immediately on shutdown
-        let mut pipe_fds = [-1i32; 2];
-        if unsafe { libc::pipe(pipe_fds.as_mut_ptr()) } < 0 {
-            return Err("Konnte interne Steuer-Pipe nicht anlegen".to_string());
-        }
-        let wake_read_fd = pipe_fds[0];
-        let wake_write_fd = pipe_fds[1];
+        // Self-pipe with O_CLOEXEC | O_NONBLOCK to wake up `poll` immediately on shutdown
+        let (wake_read, wake_write) = create_cloexec_nonblock_pipe()
+            .map_err(|err| format!("Konnte interne Steuer-Pipe nicht anlegen: {err}"))?;
 
         let running = Arc::new(AtomicBool::new(true));
         let running_clone = Arc::clone(&running);
@@ -1063,8 +1279,7 @@ impl InputEngine {
         let handle = thread::Builder::new()
             .name("breeze-input-engine".to_string())
             .spawn(move || {
-                // Keep wake_read_fd owned inside thread for automatic cleanup on exit
-                let _wake_read_guard = unsafe { File::from_raw_fd(wake_read_fd) };
+                let wake_read_fd = wake_read.as_raw_fd();
                 run_engine_loop(
                     running_clone,
                     wake_read_fd,
@@ -1073,26 +1288,24 @@ impl InputEngine {
                     window_tracker,
                     indicator_tx,
                 );
+                drop(wake_read);
             })
             .map_err(|err| format!("Fehler beim Starten des Input-Threads: {err}"))?;
 
         Ok(Self {
             running,
             handle: Some(handle),
-            wake_write_fd,
+            wake_write: Some(wake_write),
         })
     }
 
     /// Stops the background input engine cleanly.
     pub fn stop(&mut self) {
         self.running.store(false, Ordering::SeqCst);
-        if self.wake_write_fd >= 0 {
+        if let Some(wake_write) = self.wake_write.take() {
             let byte = [1u8; 1];
-            unsafe {
-                let _ = libc::write(self.wake_write_fd, byte.as_ptr().cast(), 1);
-                libc::close(self.wake_write_fd);
-            }
-            self.wake_write_fd = -1;
+            let _ = write_all_retry_eintr(wake_write.as_raw_fd(), &byte);
+            drop(wake_write);
         }
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
@@ -1115,37 +1328,77 @@ enum RawEvdevAction {
     MouseMove(f32, f32),
 }
 
+fn send_indicator_cmd(tx: &SyncSender<IndicatorCommand>, cmd: IndicatorCommand) {
+    let _ = tx.try_send(cmd);
+}
+
 fn run_engine_loop(
     running: Arc<AtomicBool>,
     wake_read_fd: RawFd,
     emitter: &mut UInputEmitter,
     config_mgr: ConfigManager,
     window_tracker: WindowTracker,
-    indicator_tx: Sender<IndicatorCommand>,
+    indicator_tx: SyncSender<IndicatorCommand>,
 ) {
     let mut state_machine = ScrollStateMachine::new();
-    let mut devices = find_input_devices();
-    let mut last_rescan = Instant::now();
+    let mut mouse_devices = find_mouse_devices();
+    let mut esc_keyboards: Vec<EvdevDevice> = Vec::new();
+    let inotify = InotifyWatcher::new_dev_input();
+    let mut last_fallback_rescan = Instant::now();
     let mut needs_rescan = false;
+    let mut bad_paths: HashSet<PathBuf> = HashSet::new();
+
+    // Pre-allocated, reused loop buffers (zero per-event / idle heap allocations)
+    let mut pollfds: Vec<libc::pollfd> = Vec::with_capacity(16);
+    let mut actions: Vec<RawEvdevAction> = Vec::with_capacity(32);
+    let mut cmd_buf: Vec<IndicatorCommand> = Vec::with_capacity(4);
 
     while running.load(Ordering::SeqCst) {
-        let now = Instant::now();
-        if needs_rescan || now.saturating_duration_since(last_rescan) >= Duration::from_secs(3) {
-            refresh_devices(&mut devices);
-            last_rescan = now;
+        if needs_rescan
+            || (inotify.is_none()
+                && Instant::now().saturating_duration_since(last_fallback_rescan)
+                    >= Duration::from_secs(3))
+        {
+            refresh_mouse_devices(&mut mouse_devices, &bad_paths);
+            bad_paths.clear();
+            if state_machine.is_active() {
+                esc_keyboards = find_esc_keyboard_devices(&mouse_devices);
+            } else {
+                esc_keyboards.clear();
+            }
+            last_fallback_rescan = Instant::now();
             needs_rescan = false;
         }
 
-        let cfg = config_mgr.snapshot();
+        let cfg = config_mgr.current();
 
-        // Build pollfd list: wake pipe + all input fds
-        let mut pollfds: Vec<libc::pollfd> = Vec::with_capacity(devices.len() + 1);
+        // Build pollfd list: [wake_pipe, optional inotify, mouse_devices..., active_esc_keyboards...]
+        pollfds.clear();
         pollfds.push(libc::pollfd {
             fd: wake_read_fd,
             events: libc::POLLIN,
             revents: 0,
         });
-        for dev in &devices {
+        let has_inotify = if let Some(ref watcher) = inotify {
+            pollfds.push(libc::pollfd {
+                fd: watcher.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            });
+            true
+        } else {
+            false
+        };
+        let mouse_start_idx = pollfds.len();
+        for dev in &mouse_devices {
+            pollfds.push(libc::pollfd {
+                fd: dev.file.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            });
+        }
+        let kbd_start_idx = pollfds.len();
+        for dev in &esc_keyboards {
             pollfds.push(libc::pollfd {
                 fd: dev.file.as_raw_fd(),
                 events: libc::POLLIN,
@@ -1153,14 +1406,15 @@ fn run_engine_loop(
             });
         }
 
-        // Poll quickly (~16ms) while pending/active, sleep up to 500ms when idle
+        // Pure event-driven sleep (-1) in Idle when inotify is active; ~16ms tick when Pending/Active
         let timeout_ms: libc::c_int = if state_machine.is_idle() {
-            500
+            if has_inotify { -1 } else { 3000 }
         } else {
             cfg.tick_interval_ms.clamp(8, 50) as libc::c_int
         };
 
-        let rc = unsafe { libc::poll(pollfds.as_mut_ptr(), pollfds.len() as libc::nfds_t, timeout_ms) };
+        let rc =
+            unsafe { libc::poll(pollfds.as_mut_ptr(), pollfds.len() as libc::nfds_t, timeout_ms) };
         if !running.load(Ordering::SeqCst) {
             break;
         }
@@ -1173,27 +1427,52 @@ fn run_engine_loop(
             continue;
         }
 
-        let mut actions = Vec::new();
+        actions.clear();
+        let listen_esc = state_machine.is_active();
         if rc > 0 {
             if (pollfds[0].revents & libc::POLLIN) != 0 {
                 break;
             }
-            for (idx, pfd) in pollfds.iter().skip(1).enumerate() {
+            if has_inotify
+                && (pollfds[1].revents & libc::POLLIN) != 0
+                && let Some(ref watcher) = inotify
+                && watcher.drain_and_check_rescan()
+            {
+                needs_rescan = true;
+            }
+            for (idx, pfd) in pollfds[mouse_start_idx..kbd_start_idx].iter().enumerate() {
+                if (pfd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL)) != 0 {
+                    if let Some(dev) = mouse_devices.get(idx) {
+                        bad_paths.insert(dev.path.clone());
+                    }
+                    needs_rescan = true;
+                    continue;
+                }
+                if (pfd.revents & libc::POLLIN) != 0
+                    && let Some(dev) = mouse_devices.get(idx)
+                    && !read_device_events(dev, listen_esc, &mut actions)
+                {
+                    bad_paths.insert(dev.path.clone());
+                    needs_rescan = true;
+                }
+            }
+            for (idx, pfd) in pollfds[kbd_start_idx..].iter().enumerate() {
                 if (pfd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL)) != 0 {
                     needs_rescan = true;
                     continue;
                 }
                 if (pfd.revents & libc::POLLIN) != 0
-                    && let Some(dev) = devices.get(idx)
-                    && !read_device_events(dev, &mut actions)
+                    && let Some(dev) = esc_keyboards.get(idx)
+                    && !read_device_events(dev, listen_esc, &mut actions)
                 {
                     needs_rescan = true;
                 }
             }
         }
 
+        let was_active_before = state_machine.is_active();
         let event_now = Instant::now();
-        for action in actions {
+        for action in actions.drain(..) {
             let was_not_idle = !state_machine.is_idle();
             let cmd = match action {
                 RawEvdevAction::MiddleDown => {
@@ -1207,7 +1486,8 @@ fn run_engine_loop(
                             || None,
                         )
                     } else {
-                        let probe = window_tracker.probe_pointer_and_start_live_cursor();
+                        let probe = window_tracker
+                            .probe_pointer_and_start_live_cursor(cfg.ignore_hyperlinks_and_tabs);
                         if probe.is_dock_or_desktop
                             || window_tracker.is_interactive_probe(&probe, &cfg)
                             || window_tracker.check_probe_excluded(&probe, &cfg).is_some()
@@ -1236,7 +1516,7 @@ fn run_engine_loop(
                 }
             };
             if let Some(c) = cmd {
-                let _ = indicator_tx.send(c);
+                send_indicator_cmd(&indicator_tx, c);
             }
             if was_not_idle && state_machine.is_idle() {
                 window_tracker.stop_live_cursor();
@@ -1246,7 +1526,7 @@ fn run_engine_loop(
         if !state_machine.is_idle() && window_tracker.take_window_context_changed() {
             let was_not_idle = !state_machine.is_idle();
             if let Some(cmd) = state_machine.on_window_context_changed(Instant::now(), &cfg) {
-                let _ = indicator_tx.send(cmd);
+                send_indicator_cmd(&indicator_tx, cmd);
             }
             if was_not_idle && state_machine.is_idle() {
                 window_tracker.stop_live_cursor();
@@ -1265,39 +1545,32 @@ fn run_engine_loop(
         }
 
         let was_not_idle = !state_machine.is_idle();
-        for cmd in state_machine.tick(Instant::now(), &cfg, emitter) {
-            let _ = indicator_tx.send(cmd);
+        state_machine.tick_into(Instant::now(), &cfg, emitter, &mut cmd_buf);
+        for cmd in cmd_buf.drain(..) {
+            send_indicator_cmd(&indicator_tx, cmd);
         }
         if was_not_idle && state_machine.is_idle() {
             window_tracker.stop_live_cursor();
         }
-    }
 
-    if let Some(cmd) = state_machine.force_stop() {
-        window_tracker.stop_live_cursor();
-        let _ = indicator_tx.send(cmd);
-    }
-    let _ = indicator_tx.send(IndicatorCommand::Shutdown);
-}
-
-fn refresh_devices(devices: &mut Vec<EvdevDevice>) {
-    let existing: HashMap<PathBuf, ()> = devices.iter().map(|d| (d.path.clone(), ())).collect();
-    let discovered = find_input_devices();
-    let mut changed = discovered.len() != existing.len();
-    if !changed {
-        for d in &discovered {
-            if !existing.contains_key(&d.path) {
-                changed = true;
-                break;
-            }
+        // On-demand keyboard FD lifecycle: open ONLY on entering Active, close immediately on exit
+        let is_active_now = state_machine.is_active();
+        if !was_active_before && is_active_now {
+            esc_keyboards = find_esc_keyboard_devices(&mouse_devices);
+        } else if was_active_before && !is_active_now {
+            esc_keyboards.clear();
         }
     }
-    if changed {
-        *devices = discovered;
+
+    esc_keyboards.clear();
+    if let Some(cmd) = state_machine.force_stop() {
+        window_tracker.stop_live_cursor();
+        send_indicator_cmd(&indicator_tx, cmd);
     }
+    send_indicator_cmd(&indicator_tx, IndicatorCommand::Shutdown);
 }
 
-fn read_device_events(dev: &EvdevDevice, out: &mut Vec<RawEvdevAction>) -> bool {
+fn read_device_events(dev: &EvdevDevice, listen_esc: bool, out: &mut Vec<RawEvdevAction>) -> bool {
     let mut buf = [InputEvent {
         time: libc::timeval {
             tv_sec: 0,
@@ -1321,6 +1594,9 @@ fn read_device_events(dev: &EvdevDevice, out: &mut Vec<RawEvdevAction>) -> bool 
             let err = io::Error::last_os_error();
             if err.kind() == io::ErrorKind::WouldBlock {
                 return true;
+            }
+            if err.kind() == io::ErrorKind::Interrupted {
+                continue;
             }
             return false;
         }
@@ -1349,7 +1625,7 @@ fn read_device_events(dev: &EvdevDevice, out: &mut Vec<RawEvdevAction>) -> bool 
                 } else if (dev.is_mouse
                     && ev.value == 1
                     && matches!(ev.code, BTN_LEFT | BTN_RIGHT | BTN_SIDE | BTN_EXTRA))
-                    || (dev.has_esc && ev.value == 1 && ev.code == KEY_ESC)
+                    || (listen_esc && dev.has_esc && ev.value == 1 && ev.code == KEY_ESC)
                 {
                     out.push(RawEvdevAction::CancelInput);
                 }
@@ -1679,5 +1955,97 @@ mod tests {
         assert!(slow > 0.5 && slow < 1.5);
         assert!(med > slow * 5.0);
         assert!(fast > 50.0 && fast <= 100.0);
+    }
+
+    #[test]
+    fn wake_pipe_enforces_cloexec_and_nonblock_and_writes_cleanly() {
+        let (read_f, write_f) = create_cloexec_nonblock_pipe().unwrap();
+        for f in [&read_f, &write_f] {
+            let fd_flags = unsafe { libc::fcntl(f.as_raw_fd(), libc::F_GETFD) };
+            assert!(fd_flags >= 0);
+            assert_ne!(fd_flags & libc::FD_CLOEXEC, 0);
+
+            let fl_flags = unsafe { libc::fcntl(f.as_raw_fd(), libc::F_GETFL) };
+            assert!(fl_flags >= 0);
+            assert_ne!(fl_flags & libc::O_NONBLOCK, 0);
+        }
+
+        let payload = b"breeze-ev";
+        write_all_retry_eintr(write_f.as_raw_fd(), payload).unwrap();
+        let mut out = [0u8; 9];
+        let n = unsafe {
+            libc::read(
+                read_f.as_raw_fd(),
+                out.as_mut_ptr().cast::<libc::c_void>(),
+                out.len(),
+            )
+        };
+        assert_eq!(n, payload.len() as isize);
+        assert_eq!(&out, payload);
+
+        // Closed read end causes write error instead of silent ignore
+        drop(read_f);
+        assert!(write_all_retry_eintr(write_f.as_raw_fd(), b"x").is_err());
+    }
+
+    #[test]
+    fn parse_inotify_buffer_filters_event_nodes_and_handles_overflow() {
+        fn build_event(mask: u32, name: &[u8]) -> Vec<u8> {
+            let mut padded_name = name.to_vec();
+            if !padded_name.is_empty() {
+                padded_name.push(0);
+                while !padded_name.len().is_multiple_of(4) {
+                    padded_name.push(0);
+                }
+            }
+            let ev = libc::inotify_event {
+                wd: 1,
+                mask,
+                cookie: 0,
+                len: padded_name.len() as u32,
+            };
+            let hdr = unsafe {
+                std::slice::from_raw_parts(
+                    (&ev as *const libc::inotify_event).cast::<u8>(),
+                    std::mem::size_of::<libc::inotify_event>(),
+                )
+            };
+            let mut buf = Vec::with_capacity(hdr.len() + padded_name.len());
+            buf.extend_from_slice(hdr);
+            buf.extend_from_slice(&padded_name);
+            buf
+        }
+
+        // Non-event files (mice, js0) do not trigger rescan
+        let mut ignored = build_event(libc::IN_CREATE, b"mice");
+        ignored.extend_from_slice(&build_event(libc::IN_ATTRIB, b"js0"));
+        assert!(!parse_inotify_buffer(&ignored));
+
+        // event* device creation triggers rescan
+        let created = build_event(libc::IN_CREATE, b"event12");
+        assert!(parse_inotify_buffer(&created));
+
+        // Queue overflow always triggers rescan
+        let overflow = build_event(libc::IN_Q_OVERFLOW, b"");
+        assert!(parse_inotify_buffer(&overflow));
+    }
+
+    #[test]
+    fn tick_into_reuses_buffer_across_ticks() {
+        let mut sm = ScrollStateMachine::new();
+        let cfg = ConfigData::default();
+        let mut emitter = MockEmitter::default();
+        let t0 = Instant::now();
+
+        let _ = sm.on_middle_down(t0, &cfg, (500, 500), (500, 500), true, || None);
+        let mut buf = Vec::with_capacity(8);
+        sm.tick_into(t0 + Duration::from_millis(180), &cfg, &mut emitter, &mut buf);
+        assert_eq!(buf.len(), 1);
+        assert!(matches!(buf[0], IndicatorCommand::Show { .. }));
+
+        // Subsequent tick clears previous commands and writes only the new UpdateOffset
+        sm.tick_into(t0 + Duration::from_millis(196), &cfg, &mut emitter, &mut buf);
+        assert_eq!(buf.len(), 1);
+        assert!(matches!(buf[0], IndicatorCommand::UpdateOffset { .. }));
     }
 }

@@ -3,12 +3,12 @@
 //! Works across KDE Plasma 6 (Wayland + KWin Scripting / D-Bus) and X11 / XWayland (`x11rb`).
 
 use std::env;
-use std::ffi::CStr;
-use std::fs::{self, File, OpenOptions};
+use std::ffi::{CStr, OsString};
+use std::fs::{File, OpenOptions};
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
-use std::sync::mpsc::{self, Sender};
+use std::sync::mpsc::{self, SyncSender};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -17,14 +17,19 @@ use x11rb::connection::Connection as X11Connection;
 use x11rb::protocol::xfixes::ConnectionExt as _;
 use x11rb::protocol::xproto::{AtomEnum, ConnectionExt as _, Window};
 use x11rb::rust_connection::RustConnection;
-use zbus::{Connection, Proxy};
+use zbus::{Connection, Proxy, connection};
 
 use crate::atspi_inspector::AtSpiInspector;
-use crate::config::ConfigData;
+use crate::config::{ConfigData, ConfigManager, write_file_atomic_secure};
 
 const KWIN_TRACKER_SCRIPT_NAME: &str = "breeze_autoscroll_tracker";
-const KWIN_CURSOR_LIVE_SCRIPT_NAME: &str = "breeze_autoscroll_cursor_live";
+const KWIN_LEGACY_LIVE_SCRIPT_NAME: &str = "breeze_autoscroll_cursor_live";
+const KWIN_SHORTCUT_PROBE_START: &str = "breeze_autoscroll_probe_start";
+const KWIN_SHORTCUT_PROBE_STOP: &str = "breeze_autoscroll_probe_stop";
+const KWIN_BRIDGE_DBUS_TIMEOUT_MS: u64 = 500;
+const BRIDGE_CHANNEL_CAPACITY: usize = 32;
 const PROBE_TIMEOUT_MS: u64 = 80;
+const MAX_DRM_SLICE_LEN: usize = 4096;
 /// Client-side headerbar / tab strip height for frameless CSD applications
 /// (GTK4/Libadwaita, Electron apps like Obsidian/VS Code/Discord, etc.).
 const CSD_HEADERBAR_HEIGHT_PX: i32 = 48;
@@ -86,12 +91,36 @@ pub struct PointerProbeResult {
     pub from_kwin: bool,
 }
 
+/// Raw pointer probe payload pushed from KWin on the D-Bus dispatcher thread.
+/// Enriched off the `zbus` thread (DRM/X11 cursor hotspot + AT-SPI2 hit-test) by the caller.
+#[derive(Debug, Clone, Default)]
+struct RawKWinProbe {
+    cursor_x: i32,
+    cursor_y: i32,
+    virt_w: i32,
+    virt_h: i32,
+    window: Option<ActiveWindowInfo>,
+    is_dock_or_desktop: bool,
+    win_x: i32,
+    win_y: i32,
+    win_w: i32,
+    win_h: i32,
+    win_pid: u32,
+    is_fullscreen: bool,
+    no_border: bool,
+    screen_x: i32,
+    screen_y: i32,
+    screen_scale: f64,
+}
+
 #[derive(Debug, Default)]
 struct TrackerState {
     kwin_active: Option<ActiveWindowInfo>,
     kwin_cursor: Option<(i32, i32)>,
     kwin_virtual_size: Option<(i32, i32)>,
     probe_seq: u64,
+    last_raw_probe: Option<RawKWinProbe>,
+    #[cfg(feature = "debug-dbus")]
     last_probe: Option<PointerProbeResult>,
     window_context_changed: bool,
 }
@@ -157,6 +186,39 @@ type FnDrmModeFreeObjectProperties = unsafe extern "C" fn(*mut DrmModeObjectProp
 type FnDrmModeGetProperty = unsafe extern "C" fn(libc::c_int, u32) -> *mut DrmModePropertyRes;
 type FnDrmModeFreeProperty = unsafe extern "C" fn(*mut DrmModePropertyRes);
 
+struct DlHandle(*mut libc::c_void);
+
+unsafe impl Send for DlHandle {}
+
+impl Drop for DlHandle {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe {
+                libc::dlclose(self.0);
+            }
+            self.0 = std::ptr::null_mut();
+        }
+    }
+}
+
+/// Safely reads a bounded C string from a fixed-size DRM property name buffer (`[c_char; 32]`)
+/// without relying on `CStr::from_ptr` (which would cause UB if no NUL byte is present).
+fn drm_prop_name_from_bytes(raw: &[libc::c_char; 32]) -> Option<&str> {
+    let bytes: &[u8; 32] = unsafe { &*(raw as *const [libc::c_char; 32]).cast::<[u8; 32]>() };
+    let len = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+    std::str::from_utf8(&bytes[..len]).ok()
+}
+
+/// Safely constructs a slice from a C pointer + length only when `ptr` is non-null and
+/// `len` is within `1..=MAX_DRM_SLICE_LEN`.
+unsafe fn safe_c_slice<'a, T>(ptr: *const T, len: usize) -> &'a [T] {
+    if ptr.is_null() || len == 0 || len > MAX_DRM_SLICE_LEN {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(ptr, len) }
+    }
+}
+
 struct CursorPlaneInfo {
     plane_id: u32,
     crtc_x_prop: u32,
@@ -171,6 +233,38 @@ struct DrmCursorInspector {
     free_plane: FnDrmModeFreePlane,
     get_obj_props: FnDrmModeObjectGetProperties,
     free_obj_props: FnDrmModeFreeObjectProperties,
+    // Declared LAST so `_file` (DRM FD) is closed before `libdrm.so.2` is `dlclose`d.
+    _dl_handle: DlHandle,
+}
+
+enum DrmState {
+    Uninitialized,
+    Unavailable,
+    Ready(DrmCursorInspector),
+}
+
+impl DrmState {
+    fn query_or_init_with<F, Q>(&mut self, open_fn: F, query_fn: Q) -> Option<(i32, i32)>
+    where
+        F: FnOnce() -> Option<DrmCursorInspector>,
+        Q: FnOnce(&DrmCursorInspector) -> Option<(i32, i32)>,
+    {
+        match self {
+            DrmState::Uninitialized => match open_fn() {
+                Some(inspector) => {
+                    let pos = query_fn(&inspector);
+                    *self = DrmState::Ready(inspector);
+                    pos
+                }
+                None => {
+                    *self = DrmState::Unavailable;
+                    None
+                }
+            },
+            DrmState::Unavailable => None,
+            DrmState::Ready(inspector) => query_fn(inspector),
+        }
+    }
 }
 
 unsafe impl Send for DrmCursorInspector {}
@@ -178,29 +272,31 @@ unsafe impl Send for DrmCursorInspector {}
 impl DrmCursorInspector {
     fn open() -> Option<Self> {
         unsafe {
-            let handle = libc::dlopen(c"libdrm.so.2".as_ptr(), libc::RTLD_LAZY);
-            if handle.is_null() {
+            let raw_handle = libc::dlopen(c"libdrm.so.2".as_ptr(), libc::RTLD_LAZY);
+            if raw_handle.is_null() {
                 return None;
             }
+            // RAII guard ensures `dlclose` on every early return path.
+            let dl_handle = DlHandle(raw_handle);
 
             let set_cap: FnDrmSetClientCap =
-                std::mem::transmute(load_sym(handle, c"drmSetClientCap")?);
+                std::mem::transmute(load_sym(dl_handle.0, c"drmSetClientCap")?);
             let get_res: FnDrmModeGetPlaneResources =
-                std::mem::transmute(load_sym(handle, c"drmModeGetPlaneResources")?);
+                std::mem::transmute(load_sym(dl_handle.0, c"drmModeGetPlaneResources")?);
             let free_res: FnDrmModeFreePlaneResources =
-                std::mem::transmute(load_sym(handle, c"drmModeFreePlaneResources")?);
+                std::mem::transmute(load_sym(dl_handle.0, c"drmModeFreePlaneResources")?);
             let get_plane: FnDrmModeGetPlane =
-                std::mem::transmute(load_sym(handle, c"drmModeGetPlane")?);
+                std::mem::transmute(load_sym(dl_handle.0, c"drmModeGetPlane")?);
             let free_plane: FnDrmModeFreePlane =
-                std::mem::transmute(load_sym(handle, c"drmModeFreePlane")?);
+                std::mem::transmute(load_sym(dl_handle.0, c"drmModeFreePlane")?);
             let get_obj_props: FnDrmModeObjectGetProperties =
-                std::mem::transmute(load_sym(handle, c"drmModeObjectGetProperties")?);
+                std::mem::transmute(load_sym(dl_handle.0, c"drmModeObjectGetProperties")?);
             let free_obj_props: FnDrmModeFreeObjectProperties =
-                std::mem::transmute(load_sym(handle, c"drmModeFreeObjectProperties")?);
+                std::mem::transmute(load_sym(dl_handle.0, c"drmModeFreeObjectProperties")?);
             let get_prop: FnDrmModeGetProperty =
-                std::mem::transmute(load_sym(handle, c"drmModeGetProperty")?);
+                std::mem::transmute(load_sym(dl_handle.0, c"drmModeGetProperty")?);
             let free_prop: FnDrmModeFreeProperty =
-                std::mem::transmute(load_sym(handle, c"drmModeFreeProperty")?);
+                std::mem::transmute(load_sym(dl_handle.0, c"drmModeFreeProperty")?);
 
             for card_idx in 0..4 {
                 let path = format!("/dev/dri/card{card_idx}");
@@ -220,7 +316,7 @@ impl DrmCursorInspector {
                     continue;
                 }
                 let count = (*res_ptr).count_planes as usize;
-                let plane_ids = std::slice::from_raw_parts((*res_ptr).planes, count).to_vec();
+                let plane_ids = safe_c_slice((*res_ptr).planes, count).to_vec();
                 free_res(res_ptr);
 
                 let mut cursor_planes = Vec::new();
@@ -230,20 +326,20 @@ impl DrmCursorInspector {
                         continue;
                     }
                     let nprops = (*props_ptr).count_props as usize;
-                    let prop_ids = std::slice::from_raw_parts((*props_ptr).props, nprops);
-                    let prop_vals = std::slice::from_raw_parts((*props_ptr).prop_values, nprops);
+                    let prop_ids = safe_c_slice((*props_ptr).props, nprops);
+                    let prop_vals = safe_c_slice((*props_ptr).prop_values, nprops);
+                    let pair_count = prop_ids.len().min(prop_vals.len());
 
                     let mut plane_type = 0u64;
                     let mut crtc_x_prop = 0u32;
                     let mut crtc_y_prop = 0u32;
 
-                    for i in 0..nprops {
+                    for i in 0..pair_count {
                         let p_ptr = get_prop(fd, prop_ids[i]);
                         if p_ptr.is_null() {
                             continue;
                         }
-                        let name_cstr = CStr::from_ptr((*p_ptr).name.as_ptr());
-                        if let Ok(name) = name_cstr.to_str() {
+                        if let Some(name) = drm_prop_name_from_bytes(&(*p_ptr).name) {
                             match name {
                                 "type" => plane_type = prop_vals[i],
                                 "CRTC_X" => crtc_x_prop = prop_ids[i],
@@ -273,6 +369,7 @@ impl DrmCursorInspector {
                         free_plane,
                         get_obj_props,
                         free_obj_props,
+                        _dl_handle: dl_handle,
                     });
                 }
             }
@@ -301,12 +398,13 @@ impl DrmCursorInspector {
                     continue;
                 }
                 let nprops = (*props_ptr).count_props as usize;
-                let prop_ids = std::slice::from_raw_parts((*props_ptr).props, nprops);
-                let prop_vals = std::slice::from_raw_parts((*props_ptr).prop_values, nprops);
+                let prop_ids = safe_c_slice((*props_ptr).props, nprops);
+                let prop_vals = safe_c_slice((*props_ptr).prop_values, nprops);
+                let pair_count = prop_ids.len().min(prop_vals.len());
 
                 let mut crtc_x: Option<i32> = None;
                 let mut crtc_y: Option<i32> = None;
-                for i in 0..nprops {
+                for i in 0..pair_count {
                     if prop_ids[i] == cp.crtc_x_prop {
                         crtc_x = Some(prop_vals[i] as u32 as i32);
                     } else if prop_ids[i] == cp.crtc_y_prop {
@@ -417,13 +515,14 @@ impl X11Client {
 
 enum BridgeCmd {
     EnsureTrackerInstalled,
+    ReinstallTracker,
     StartLiveCursorAndProbe,
     StopLiveCursor,
     Shutdown,
 }
 
 struct BridgeHandle {
-    tx: Sender<BridgeCmd>,
+    tx: SyncSender<BridgeCmd>,
     join: Option<JoinHandle<()>>,
 }
 
@@ -432,7 +531,7 @@ struct BridgeHandle {
 pub struct WindowTracker {
     sync: Arc<(Mutex<TrackerState>, Condvar)>,
     x11: Arc<Mutex<Option<X11Client>>>,
-    drm: Arc<Mutex<Option<DrmCursorInspector>>>,
+    drm: Arc<Mutex<DrmState>>,
     atspi: AtSpiInspector,
     bridge: Arc<Mutex<Option<BridgeHandle>>>,
 }
@@ -448,15 +547,15 @@ impl WindowTracker {
         Self {
             sync: Arc::new((Mutex::new(TrackerState::default()), Condvar::new())),
             x11: Arc::new(Mutex::new(None)),
-            drm: Arc::new(Mutex::new(None)),
+            drm: Arc::new(Mutex::new(DrmState::Uninitialized)),
             atspi: AtSpiInspector::new(),
             bridge: Arc::new(Mutex::new(None)),
         }
     }
 
-    /// Starts the persistent KWin D-Bus scripting bridge and AT-SPI2 inspector.
-    pub fn start_kwin_bridge(&self) {
-        self.atspi.start();
+    /// Starts the persistent KWin D-Bus scripting bridge and opt-in AT-SPI2 inspector.
+    pub fn start_kwin_bridge(&self, config: ConfigManager) {
+        self.atspi.start(config);
 
         let Ok(mut guard) = self.bridge.lock() else {
             return;
@@ -465,17 +564,22 @@ impl WindowTracker {
             return;
         }
 
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = mpsc::sync_channel(BRIDGE_CHANNEL_CAPACITY);
         let join = thread::Builder::new()
             .name("breeze-kwin-bridge".to_string())
             .spawn(move || run_kwin_bridge_loop(rx))
             .ok();
 
-        let _ = tx.send(BridgeCmd::EnsureTrackerInstalled);
+        let _ = tx.try_send(BridgeCmd::EnsureTrackerInstalled);
         *guard = Some(BridgeHandle { tx, join });
     }
 
-    /// Unloads ephemeral KWin scripts and shuts down the KWin bridge & AT-SPI2 worker threads.
+    /// Notifies the AT-SPI2 worker to re-read runtime configuration (e.g. `auto_enable_atspi`).
+    pub fn sync_atspi_config(&self) {
+        self.atspi.sync_config();
+    }
+
+    /// Unloads the persistent KWin script and shuts down the KWin bridge & AT-SPI2 worker threads.
     pub fn stop_kwin_bridge(&self) {
         self.atspi.stop();
 
@@ -485,7 +589,9 @@ impl WindowTracker {
             None
         };
         if let Some(mut h) = handle {
-            let _ = h.tx.send(BridgeCmd::Shutdown);
+            if h.tx.try_send(BridgeCmd::Shutdown).is_err() {
+                let _ = h.tx.send(BridgeCmd::Shutdown);
+            }
             if let Some(j) = h.join.take() {
                 let _ = j.join();
             }
@@ -517,7 +623,10 @@ impl WindowTracker {
         }
     }
 
-    /// Receives live pointer probe data pushed by `kwin_cursor_live.js` via D-Bus and wakes waiters.
+    /// Stores raw live pointer probe data pushed by the persistent KWin script via D-Bus
+    /// and immediately wakes waiters.
+    ///
+    /// Strictly non-blocking: performs NO DRM, X11, or AT-SPI2 I/O on the `zbus` dispatcher thread.
     #[allow(clippy::too_many_arguments)]
     pub fn report_pointer_probe(
         &self,
@@ -541,32 +650,6 @@ impl WindowTracker {
         screen_y: i32,
         screen_scale: f64,
     ) {
-        let x11_size = self.x11_root_size();
-        let (overlay_x, overlay_y) = scale_kwin_to_x11(
-            cursor_x,
-            cursor_y,
-            (virt_w > 0 && virt_h > 0).then_some((virt_w, virt_h)),
-            x11_size,
-        );
-
-        let scale = if screen_scale > 0.1 {
-            screen_scale
-        } else {
-            1.0
-        };
-        let (hotspot_x, hotspot_y, is_interactive_cursor) =
-            if let Some((crtc_x, crtc_y)) = self.query_drm_cursor_crtc_pos() {
-                let local_x = ((cursor_x - screen_x) as f64 * scale).round() as i32;
-                let local_y = ((cursor_y - screen_y) as f64 * scale).round() as i32;
-                let hx = local_x - crtc_x;
-                let hy = local_y - crtc_y;
-                (Some(hx), Some(hy), is_pointer_hand_hotspot(hx, hy))
-            } else if let Some(((hx, hy), interactive)) = self.query_x11_cursor_hotspot() {
-                (Some(hx), Some(hy), interactive)
-            } else {
-                (None, None, false)
-            };
-
         let window = if app_class.is_empty()
             && app_name.is_empty()
             && desktop_file.is_empty()
@@ -583,40 +666,11 @@ impl WindowTracker {
             })
         };
 
-        // For native desktop apps (Dolphin, Konsole, Kate, Okular, GTK apps, etc.),
-        // inspect the exact widget/item under the pointer via AT-SPI2.
-        let is_browser = window.as_ref().is_some_and(is_browser_window);
-        let in_client_rect = win_w > 0
-            && win_h > 0
-            && cursor_x >= win_x
-            && cursor_x < win_x + win_w
-            && cursor_y >= win_y
-            && cursor_y < win_y + win_h;
-
-        let (atspi_role, is_interactive_atspi) = if !is_dock_or_desktop
-            && !is_interactive_cursor
-            && !is_browser
-            && win_pid > 0
-            && in_client_rect
-        {
-            let rel_x = cursor_x - win_x;
-            let rel_y = cursor_y - win_y;
-            let title_ref = window.as_ref().map(|w| w.title.as_str()).unwrap_or("");
-            match self.atspi.inspect_point(
-                win_pid, title_ref, rel_x, rel_y, cursor_x, cursor_y, win_w, win_h,
-            ) {
-                Some(hit) => (Some(hit.role), hit.is_interactive),
-                None => (None, false),
-            }
-        } else {
-            (None, false)
-        };
-
-        let result = PointerProbeResult {
+        let raw = RawKWinProbe {
             cursor_x,
             cursor_y,
-            overlay_x,
-            overlay_y,
+            virt_w,
+            virt_h,
             window,
             is_dock_or_desktop,
             win_x,
@@ -626,12 +680,9 @@ impl WindowTracker {
             win_pid,
             is_fullscreen,
             no_border,
-            hotspot_x,
-            hotspot_y,
-            is_interactive_cursor,
-            atspi_role,
-            is_interactive_atspi,
-            from_kwin: true,
+            screen_x,
+            screen_y,
+            screen_scale,
         };
 
         let (lock, cvar) = &*self.sync;
@@ -642,12 +693,109 @@ impl WindowTracker {
             }
             guard.window_context_changed = false;
             guard.probe_seq = guard.probe_seq.wrapping_add(1);
-            guard.last_probe = Some(result);
+            guard.last_raw_probe = Some(raw);
             cvar.notify_all();
         }
     }
 
-    /// Updates live cursor coordinates streamed from `kwin_cursor_live.js` while autoscroll is active.
+    /// Enriches a raw KWin probe with X11 overlay scaling, DRM/X11 cursor hotspot detection,
+    /// and optional AT-SPI2 hit-testing. Runs on the caller (`InputEngine`) thread, never on `zbus`.
+    fn enrich_raw_probe(&self, raw: RawKWinProbe, inspect_atspi: bool) -> PointerProbeResult {
+        let x11_size = self.x11_root_size();
+        let (overlay_x, overlay_y) = scale_kwin_to_x11(
+            raw.cursor_x,
+            raw.cursor_y,
+            (raw.virt_w > 0 && raw.virt_h > 0).then_some((raw.virt_w, raw.virt_h)),
+            x11_size,
+        );
+
+        let scale = if raw.screen_scale.is_finite() && raw.screen_scale > 0.1 {
+            raw.screen_scale
+        } else {
+            1.0
+        };
+        let (hotspot_x, hotspot_y, is_interactive_cursor) =
+            if let Some((crtc_x, crtc_y)) = self.query_drm_cursor_crtc_pos() {
+                let local_x = ((raw.cursor_x - raw.screen_x) as f64 * scale).round() as i32;
+                let local_y = ((raw.cursor_y - raw.screen_y) as f64 * scale).round() as i32;
+                let hx = local_x - crtc_x;
+                let hy = local_y - crtc_y;
+                (Some(hx), Some(hy), is_pointer_hand_hotspot(hx, hy))
+            } else if let Some(((hx, hy), interactive)) = self.query_x11_cursor_hotspot() {
+                (Some(hx), Some(hy), interactive)
+            } else {
+                (None, None, false)
+            };
+
+        let is_browser = raw.window.as_ref().is_some_and(is_browser_window);
+        let in_client_rect = raw.win_w > 0
+            && raw.win_h > 0
+            && raw.cursor_x >= raw.win_x
+            && raw.cursor_x < raw.win_x + raw.win_w
+            && raw.cursor_y >= raw.win_y
+            && raw.cursor_y < raw.win_y + raw.win_h;
+
+        let (atspi_role, is_interactive_atspi) = if inspect_atspi
+            && !raw.is_dock_or_desktop
+            && !is_interactive_cursor
+            && !is_browser
+            && raw.win_pid > 0
+            && in_client_rect
+        {
+            let rel_x = raw.cursor_x - raw.win_x;
+            let rel_y = raw.cursor_y - raw.win_y;
+            let title_ref = raw.window.as_ref().map(|w| w.title.as_str()).unwrap_or("");
+            match self.atspi.inspect_point(
+                raw.win_pid,
+                title_ref,
+                rel_x,
+                rel_y,
+                raw.cursor_x,
+                raw.cursor_y,
+                raw.win_w,
+                raw.win_h,
+            ) {
+                Some(hit) => (Some(hit.role), hit.is_interactive),
+                None => (None, false),
+            }
+        } else {
+            (None, false)
+        };
+
+        let result = PointerProbeResult {
+            cursor_x: raw.cursor_x,
+            cursor_y: raw.cursor_y,
+            overlay_x,
+            overlay_y,
+            window: raw.window,
+            is_dock_or_desktop: raw.is_dock_or_desktop,
+            win_x: raw.win_x,
+            win_y: raw.win_y,
+            win_w: raw.win_w,
+            win_h: raw.win_h,
+            win_pid: raw.win_pid,
+            is_fullscreen: raw.is_fullscreen,
+            no_border: raw.no_border,
+            hotspot_x,
+            hotspot_y,
+            is_interactive_cursor,
+            atspi_role,
+            is_interactive_atspi,
+            from_kwin: true,
+        };
+
+        #[cfg(feature = "debug-dbus")]
+        {
+            let (lock, _) = &*self.sync;
+            if let Ok(mut guard) = lock.lock() {
+                guard.last_probe = Some(result.clone());
+            }
+        }
+
+        result
+    }
+
+    /// Updates live cursor coordinates streamed from the persistent KWin script while active.
     pub fn update_cursor_pos(&self, cursor_x: i32, cursor_y: i32) {
         let (lock, _) = &*self.sync;
         if let Ok(mut guard) = lock.lock() {
@@ -675,9 +823,9 @@ impl WindowTracker {
         }
     }
 
-    /// Probes the exact cursor position and target window under the pointer, and starts live
-    /// KWin cursor streaming on Wayland sessions.
-    pub fn probe_pointer_and_start_live_cursor(&self) -> PointerProbeResult {
+    /// Probes the exact cursor position and target window under the pointer, starts live
+    /// KWin cursor streaming on Wayland sessions, and enriches the probe off the `zbus` thread.
+    pub fn probe_pointer_and_start_live_cursor(&self, inspect_atspi: bool) -> PointerProbeResult {
         let bridge_tx = self
             .bridge
             .lock()
@@ -695,14 +843,14 @@ impl WindowTracker {
                     .unwrap_or(0)
             };
 
-            if tx.send(BridgeCmd::StartLiveCursorAndProbe).is_ok() {
+            if tx.try_send(BridgeCmd::StartLiveCursorAndProbe).is_ok() {
                 let deadline = Instant::now() + Duration::from_millis(PROBE_TIMEOUT_MS);
                 let (lock, cvar) = &*self.sync;
-                let mut probed: Option<PointerProbeResult> = None;
+                let mut raw_probed: Option<RawKWinProbe> = None;
                 if let Ok(mut guard) = lock.lock() {
                     loop {
                         if guard.probe_seq != baseline_seq {
-                            probed = guard.last_probe.clone();
+                            raw_probed = guard.last_raw_probe.clone();
                             break;
                         }
                         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -713,7 +861,7 @@ impl WindowTracker {
                             Ok((next_guard, timeout_res)) => {
                                 guard = next_guard;
                                 if guard.probe_seq != baseline_seq {
-                                    probed = guard.last_probe.clone();
+                                    raw_probed = guard.last_raw_probe.clone();
                                     break;
                                 }
                                 if timeout_res.timed_out() {
@@ -724,9 +872,11 @@ impl WindowTracker {
                         }
                     }
                 }
-                if let Some(probe) = probed {
-                    return probe;
+                if let Some(raw) = raw_probed {
+                    return self.enrich_raw_probe(raw, inspect_atspi);
                 }
+                // KWin may have restarted and dropped our persistent script; schedule self-heal.
+                let _ = tx.try_send(BridgeCmd::ReinstallTracker);
             }
         }
 
@@ -829,26 +979,28 @@ impl WindowTracker {
     }
 
     /// Triggers an asynchronous KWin pointer probe without blocking the caller's D-Bus thread.
+    #[cfg(feature = "debug-dbus")]
     pub fn trigger_probe(&self) {
         if let Ok(guard) = self.bridge.lock()
             && let Some(handle) = guard.as_ref()
         {
-            let _ = handle.tx.send(BridgeCmd::StartLiveCursorAndProbe);
+            let _ = handle.tx.try_send(BridgeCmd::StartLiveCursorAndProbe);
         }
     }
 
     /// Returns the most recent KWin pointer probe result, if any.
+    #[cfg(feature = "debug-dbus")]
     pub fn last_probe_snapshot(&self) -> Option<PointerProbeResult> {
         let (lock, _) = &*self.sync;
         lock.lock().ok().and_then(|g| g.last_probe.clone())
     }
 
-    /// Unloads the ephemeral KWin live-cursor script once autoscroll stops.
+    /// Stops live cursor streaming in the persistent KWin script once autoscroll stops.
     pub fn stop_live_cursor(&self) {
         if let Ok(guard) = self.bridge.lock()
             && let Some(handle) = guard.as_ref()
         {
-            let _ = handle.tx.send(BridgeCmd::StopLiveCursor);
+            let _ = handle.tx.try_send(BridgeCmd::StopLiveCursor);
         }
     }
 
@@ -917,12 +1069,9 @@ impl WindowTracker {
         let Ok(mut guard) = self.drm.lock() else {
             return None;
         };
-        if guard.is_none() {
-            *guard = DrmCursorInspector::open();
-        }
-        guard
-            .as_ref()
-            .and_then(|inspector| inspector.query_active_cursor_crtc_pos())
+        guard.query_or_init_with(DrmCursorInspector::open, |inspector| {
+            inspector.query_active_cursor_crtc_pos()
+        })
     }
 
     fn with_x11<T, F: Fn(&X11Client) -> Result<Option<T>, ()>>(&self, f: F) -> Option<T> {
@@ -1221,57 +1370,84 @@ fn query_x11_window_title<C: X11Connection>(conn: &C, win: Window) -> Option<Str
 }
 
 // ============================================================================
-// Persistent KWin D-Bus Scripting Bridge
+// Persistent KWin D-Bus Scripting Bridge (Single Persistent Script + kglobalaccel)
 // ============================================================================
 
 fn run_kwin_bridge_loop(rx: mpsc::Receiver<BridgeCmd>) {
-    let tracker_path = kwin_script_path("kwin_tracker.js");
-    let live_path = kwin_script_path("kwin_cursor_live.js");
-    if let Some(parent) = tracker_path.parent() {
-        let _ = fs::create_dir_all(parent);
+    let tracker_path = match kwin_script_path("kwin_tracker.js") {
+        Ok(p) => p,
+        Err(err) => {
+            eprintln!("[WindowDetector] KWin-Skript-Verzeichnis nicht verfügbar (fail closed): {err}");
+            return;
+        }
+    };
+    if let Err(err) = write_file_atomic_secure(&tracker_path, KWIN_PERSISTENT_BRIDGE_JS.as_bytes(), true) {
+        eprintln!("[WindowDetector] Konnte KWin-Skript nicht sicher schreiben: {err}");
+        return;
     }
-    let _ = fs::write(&tracker_path, KWIN_TRACKER_JS);
-    let _ = fs::write(&live_path, KWIN_CURSOR_LIVE_JS);
 
     let tracker_str = tracker_path.to_string_lossy().into_owned();
-    let live_str = live_path.to_string_lossy().into_owned();
 
     zbus::block_on(async move {
         let mut conn: Option<Connection> = None;
+        let mut tracker_installed = false;
 
         while let Ok(cmd) = rx.recv() {
             match cmd {
                 BridgeCmd::EnsureTrackerInstalled => {
-                    let _ = ensure_loaded_and_run(
-                        &mut conn,
-                        &tracker_str,
-                        KWIN_TRACKER_SCRIPT_NAME,
-                    )
-                    .await;
+                    let _ = unload_script(&mut conn, KWIN_LEGACY_LIVE_SCRIPT_NAME).await;
+                    tracker_installed =
+                        ensure_loaded_and_run(&mut conn, &tracker_str, KWIN_TRACKER_SCRIPT_NAME)
+                            .await
+                            .is_ok();
+                }
+                BridgeCmd::ReinstallTracker => {
+                    conn = None;
+                    let _ = unload_script(&mut conn, KWIN_LEGACY_LIVE_SCRIPT_NAME).await;
+                    tracker_installed =
+                        ensure_loaded_and_run(&mut conn, &tracker_str, KWIN_TRACKER_SCRIPT_NAME)
+                            .await
+                            .is_ok();
                 }
                 BridgeCmd::StartLiveCursorAndProbe => {
-                    if ensure_loaded_and_run(
-                        &mut conn,
-                        &live_str,
-                        KWIN_CURSOR_LIVE_SCRIPT_NAME,
-                    )
-                    .await
-                    .is_err()
+                    if !tracker_installed {
+                        tracker_installed = ensure_loaded_and_run(
+                            &mut conn,
+                            &tracker_str,
+                            KWIN_TRACKER_SCRIPT_NAME,
+                        )
+                        .await
+                        .is_ok();
+                    }
+                    if tracker_installed
+                        && invoke_kwin_shortcut(&mut conn, KWIN_SHORTCUT_PROBE_START)
+                            .await
+                            .is_err()
                     {
                         conn = None;
-                        let _ = ensure_loaded_and_run(
+                        tracker_installed = ensure_loaded_and_run(
                             &mut conn,
-                            &live_str,
-                            KWIN_CURSOR_LIVE_SCRIPT_NAME,
+                            &tracker_str,
+                            KWIN_TRACKER_SCRIPT_NAME,
                         )
-                        .await;
+                        .await
+                        .is_ok();
+                        if tracker_installed {
+                            let _ =
+                                invoke_kwin_shortcut(&mut conn, KWIN_SHORTCUT_PROBE_START).await;
+                        }
                     }
                 }
                 BridgeCmd::StopLiveCursor => {
-                    let _ = unload_script(&mut conn, KWIN_CURSOR_LIVE_SCRIPT_NAME).await;
+                    if tracker_installed {
+                        let _ = invoke_kwin_shortcut(&mut conn, KWIN_SHORTCUT_PROBE_STOP).await;
+                    }
                 }
                 BridgeCmd::Shutdown => {
-                    let _ = unload_script(&mut conn, KWIN_CURSOR_LIVE_SCRIPT_NAME).await;
+                    if tracker_installed {
+                        let _ = invoke_kwin_shortcut(&mut conn, KWIN_SHORTCUT_PROBE_STOP).await;
+                    }
+                    let _ = unload_script(&mut conn, KWIN_LEGACY_LIVE_SCRIPT_NAME).await;
                     let _ = unload_script(&mut conn, KWIN_TRACKER_SCRIPT_NAME).await;
                     break;
                 }
@@ -1282,9 +1458,32 @@ fn run_kwin_bridge_loop(rx: mpsc::Receiver<BridgeCmd>) {
 
 async fn ensure_session_conn(slot: &mut Option<Connection>) -> Result<&Connection, ()> {
     if slot.is_none() {
-        *slot = Connection::session().await.ok();
+        *slot = connection::Builder::session()
+            .method_timeout(Duration::from_millis(KWIN_BRIDGE_DBUS_TIMEOUT_MS))
+            .build()
+            .await
+            .ok();
     }
     slot.as_ref().ok_or(())
+}
+
+async fn invoke_kwin_shortcut(
+    conn_slot: &mut Option<Connection>,
+    shortcut_name: &str,
+) -> Result<(), ()> {
+    let conn = ensure_session_conn(conn_slot).await?;
+    let accel = Proxy::new(
+        conn,
+        "org.kde.kglobalaccel",
+        "/component/kwin",
+        "org.kde.kglobalaccel.Component",
+    )
+    .await
+    .map_err(|_| ())?;
+    accel
+        .call::<_, _, ()>("invokeShortcut", &(shortcut_name,))
+        .await
+        .map_err(|_| ())
 }
 
 async fn ensure_loaded_and_run(
@@ -1341,18 +1540,37 @@ async fn unload_script(conn_slot: &mut Option<Connection>, plugin_name: &str) ->
     Ok(())
 }
 
-fn kwin_script_path(file_name: &str) -> PathBuf {
-    if let Some(cache) = env::var_os("XDG_CACHE_HOME")
-        && !cache.is_empty()
+/// Resolves the secure runtime directory for KWin JS scripts:
+/// prefers `$XDG_RUNTIME_DIR/breeze-autoscroll`, falls back only to `$HOME/.cache/breeze-autoscroll`,
+/// and fails closed if neither is set (never uses `/tmp`).
+fn kwin_script_dir_from(
+    xdg_runtime_dir: Option<OsString>,
+    home: Option<OsString>,
+) -> Result<PathBuf, String> {
+    if let Some(runtime_dir) = xdg_runtime_dir
+        && !runtime_dir.is_empty()
     {
-        return PathBuf::from(cache)
-            .join("breeze-autoscroll")
-            .join(file_name);
+        let p = PathBuf::from(runtime_dir);
+        if p.is_absolute() {
+            return Ok(p.join("breeze-autoscroll"));
+        }
     }
-    let home = env::var_os("HOME").unwrap_or_else(|| "/tmp".into());
-    PathBuf::from(home)
-        .join(".cache/breeze-autoscroll")
-        .join(file_name)
+    if let Some(h) = home
+        && !h.is_empty()
+    {
+        let p = PathBuf::from(h);
+        if p.is_absolute() {
+            return Ok(p.join(".cache/breeze-autoscroll"));
+        }
+    }
+    Err(
+        "Weder XDG_RUNTIME_DIR noch HOME ist auf einen absoluten Pfad gesetzt; kein sicherer KWin-Skript-Pfad verfügbar."
+            .to_string(),
+    )
+}
+
+fn kwin_script_path(file_name: &str) -> Result<PathBuf, String> {
+    Ok(kwin_script_dir_from(env::var_os("XDG_RUNTIME_DIR"), env::var_os("HOME"))?.join(file_name))
 }
 
 fn now_epoch_ms() -> u64 {
@@ -1362,11 +1580,20 @@ fn now_epoch_ms() -> u64 {
         .unwrap_or(0)
 }
 
-const KWIN_TRACKER_JS: &str = r#"
-// Breeze Autoscroll - Ephemeral KDE Plasma 6 Active Window & Browser Tab Tracker
+const KWIN_PERSISTENT_BRIDGE_JS: &str = r#"
+// Breeze Autoscroll - Single Persistent KDE Plasma 6 Window Tracker, Pointer Probe & Live Cursor Bridge
+// Loaded once per session and controlled via kglobalaccel without loadScript/unloadScript churn or signal leaks.
 (function () {
     var trackedWin = null;
     var trackedHandler = null;
+
+    var liveActive = false;
+    var probeWin = null;
+    var probeCaptionHandler = null;
+    var cursorHandler = null;
+    var lastX = -999999;
+    var lastY = -999999;
+    var lastSentMs = 0;
 
     function sendWindowInfo(win) {
         var cls = "";
@@ -1415,21 +1642,6 @@ const KWIN_TRACKER_JS: &str = r#"
         }
     }
 
-    workspace.windowActivated.connect(function (win) {
-        bindWindow(win);
-    });
-
-    bindWindow(workspace.activeWindow);
-})();
-"#;
-
-const KWIN_CURSOR_LIVE_JS: &str = r#"
-// Breeze Autoscroll - On-Demand Pointer Probe & Live Cursor Tracker
-(function () {
-    var lastX = -999999;
-    var lastY = -999999;
-    var lastSentMs = 0;
-
     function pickWindowUnderCursor(p) {
         try {
             if (p && typeof workspace.windowAt === "function") {
@@ -1451,6 +1663,9 @@ const KWIN_CURSOR_LIVE_JS: &str = r#"
     }
 
     function notifyContextChanged() {
+        if (!liveActive) {
+            return;
+        }
         try {
             callDBus(
                 "org.breeze.Autoscroll",
@@ -1461,7 +1676,28 @@ const KWIN_CURSOR_LIVE_JS: &str = r#"
         } catch (e) {}
     }
 
-    function sendProbe() {
+    function stopLiveCursor() {
+        liveActive = false;
+        if (cursorHandler && workspace.cursorPosChanged) {
+            try {
+                workspace.cursorPosChanged.disconnect(cursorHandler);
+            } catch (e) {}
+        }
+        cursorHandler = null;
+        if (probeWin && probeCaptionHandler && probeWin.captionChanged) {
+            try {
+                probeWin.captionChanged.disconnect(probeCaptionHandler);
+            } catch (e) {}
+        }
+        probeWin = null;
+        probeCaptionHandler = null;
+    }
+
+    function startProbeAndLiveCursor() {
+        // Always disconnect any previous probe/cursor handlers first to avoid signal leaks
+        stopLiveCursor();
+        liveActive = true;
+
         var p = workspace.cursorPos;
         var cx = p ? Math.round(p.x) : 0;
         var cy = p ? Math.round(p.y) : 0;
@@ -1529,12 +1765,10 @@ const KWIN_CURSOR_LIVE_JS: &str = r#"
                 wPid = Math.round(win.pid);
             }
             if (win.captionChanged) {
-                win.captionChanged.connect(notifyContextChanged);
+                probeWin = win;
+                probeCaptionHandler = notifyContextChanged;
+                win.captionChanged.connect(probeCaptionHandler);
             }
-        }
-
-        if (workspace.windowActivated) {
-            workspace.windowActivated.connect(notifyContextChanged);
         }
 
         var sx = 0;
@@ -1563,6 +1797,30 @@ const KWIN_CURSOR_LIVE_JS: &str = r#"
         lastY = cy;
         lastSentMs = Date.now();
 
+        if (workspace.cursorPosChanged) {
+            cursorHandler = function () {
+                if (!liveActive) return;
+                var cur = workspace.cursorPos;
+                if (!cur) return;
+                var nx = Math.round(cur.x);
+                var ny = Math.round(cur.y);
+                var now = Date.now();
+                if (now - lastSentMs >= 10 && (nx !== lastX || ny !== lastY)) {
+                    lastX = nx;
+                    lastY = ny;
+                    lastSentMs = now;
+                    callDBus(
+                        "org.breeze.Autoscroll",
+                        "/Autoscroll",
+                        "org.breeze.Autoscroll",
+                        "UpdateCursorPos",
+                        String(nx), String(ny)
+                    );
+                }
+            };
+            workspace.cursorPosChanged.connect(cursorHandler);
+        }
+
         var coords = String(cx) + "," + String(cy) + "," + String(vw) + "," + String(vh);
         var winGeom = String(wx) + "," + String(wy) + "," + String(ww) + "," + String(wh) + "," + isFullScreen + "," + noBorder + "," + String(wPid);
         var screenGeom = String(sx) + "," + String(sy) + "," + sScale;
@@ -1578,29 +1836,29 @@ const KWIN_CURSOR_LIVE_JS: &str = r#"
         );
     }
 
-    if (workspace.cursorPosChanged) {
-        workspace.cursorPosChanged.connect(function () {
-            var p = workspace.cursorPos;
-            if (!p) return;
-            var nx = Math.round(p.x);
-            var ny = Math.round(p.y);
-            var now = Date.now();
-            if (now - lastSentMs >= 10 && (nx !== lastX || ny !== lastY)) {
-                lastX = nx;
-                lastY = ny;
-                lastSentMs = now;
-                callDBus(
-                    "org.breeze.Autoscroll",
-                    "/Autoscroll",
-                    "org.breeze.Autoscroll",
-                    "UpdateCursorPos",
-                    String(nx), String(ny)
-                );
-            }
-        });
+    workspace.windowActivated.connect(function (win) {
+        bindWindow(win);
+        if (liveActive) {
+            notifyContextChanged();
+        }
+    });
+
+    if (typeof registerShortcut === "function") {
+        registerShortcut(
+            "breeze_autoscroll_probe_start",
+            "Breeze Autoscroll Probe Start",
+            "",
+            startProbeAndLiveCursor
+        );
+        registerShortcut(
+            "breeze_autoscroll_probe_stop",
+            "Breeze Autoscroll Probe Stop",
+            "",
+            stopLiveCursor
+        );
     }
 
-    sendProbe();
+    bindWindow(workspace.activeWindow);
 })();
 "#;
 
@@ -1998,5 +2256,88 @@ mod tests {
         };
         assert!(is_interactive_window_chrome(&generic_csd_tab_probe, &cfg));
         assert!(tracker.is_interactive_probe(&generic_csd_tab_probe, &cfg));
+    }
+
+    #[test]
+    fn kwin_script_dir_prefers_xdg_runtime_and_fails_closed_without_tmp() {
+        assert!(kwin_script_dir_from(None, None).is_err());
+        assert!(kwin_script_dir_from(Some(OsString::new()), Some(OsString::new())).is_err());
+        assert!(kwin_script_dir_from(Some("relative".into()), None).is_err());
+        assert_eq!(
+            kwin_script_dir_from(Some("/run/user/1000".into()), Some("/home/alice".into()))
+                .unwrap(),
+            PathBuf::from("/run/user/1000/breeze-autoscroll")
+        );
+        assert_eq!(
+            kwin_script_dir_from(None, Some("/home/alice".into())).unwrap(),
+            PathBuf::from("/home/alice/.cache/breeze-autoscroll")
+        );
+    }
+
+    #[test]
+    fn drm_prop_name_and_safe_c_slice_guard_against_missing_nul_and_null_ptrs() {
+        // Normal NUL-terminated property name
+        let mut normal = [0 as libc::c_char; 32];
+        for (dst, &b) in normal.iter_mut().zip(b"CRTC_X".iter()) {
+            *dst = b as libc::c_char;
+        }
+        assert_eq!(drm_prop_name_from_bytes(&normal), Some("CRTC_X"));
+
+        // Completely full 32-byte buffer WITHOUT NUL byte (would UB with CStr::from_ptr!)
+        let no_nul = [b'A' as libc::c_char; 32];
+        assert_eq!(
+            drm_prop_name_from_bytes(&no_nul),
+            Some("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
+        );
+
+        // Invalid UTF-8 returns None safely
+        let mut bad_utf8 = [0 as libc::c_char; 32];
+        bad_utf8[0] = 0xffu8 as libc::c_char;
+        assert_eq!(drm_prop_name_from_bytes(&bad_utf8), None);
+
+        // Null pointer or zero/excessive count always returns empty slice without UB
+        unsafe {
+            assert!(safe_c_slice::<u32>(std::ptr::null(), 10).is_empty());
+            let val = 42u32;
+            assert!(safe_c_slice(&val as *const u32, 0).is_empty());
+            assert!(safe_c_slice(&val as *const u32, MAX_DRM_SLICE_LEN + 1).is_empty());
+            assert_eq!(safe_c_slice(&val as *const u32, 1), &[42]);
+        }
+    }
+
+    #[test]
+    fn drm_state_caches_failed_initialization_to_avoid_repeated_dlopen() {
+        let mut state = DrmState::Uninitialized;
+        let mut open_calls = 0usize;
+
+        let first = state.query_or_init_with(
+            || {
+                open_calls += 1;
+                None
+            },
+            |_| Some((10, 20)),
+        );
+        assert_eq!(first, None);
+        assert_eq!(open_calls, 1);
+        assert!(matches!(state, DrmState::Unavailable));
+
+        // Subsequent queries MUST NOT invoke open_fn again
+        let second = state.query_or_init_with(
+            || {
+                open_calls += 1;
+                None
+            },
+            |_| Some((10, 20)),
+        );
+        assert_eq!(second, None);
+        assert_eq!(open_calls, 1);
+    }
+
+    #[test]
+    fn persistent_kwin_script_disconnects_signals_and_registers_shortcuts() {
+        assert!(KWIN_PERSISTENT_BRIDGE_JS.contains("breeze_autoscroll_probe_start"));
+        assert!(KWIN_PERSISTENT_BRIDGE_JS.contains("breeze_autoscroll_probe_stop"));
+        assert!(KWIN_PERSISTENT_BRIDGE_JS.contains("cursorPosChanged.disconnect"));
+        assert!(KWIN_PERSISTENT_BRIDGE_JS.contains("captionChanged.disconnect"));
     }
 }

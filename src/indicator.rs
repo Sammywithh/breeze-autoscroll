@@ -5,7 +5,7 @@
 //! with an empty XShape input region so it never steals focus or intercepts clicks.
 
 use std::env;
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::thread::{self, JoinHandle};
 
 use x11rb::connection::Connection;
@@ -22,6 +22,7 @@ use crate::input_manager::IndicatorCommand;
 pub const INDICATOR_SIZE: usize = 44;
 const BASE_DIAMETER: f32 = 32.0;
 const SUPERSAMPLE: usize = 4;
+const INDICATOR_CHANNEL_CAPACITY: usize = 64;
 
 #[derive(Clone, Copy)]
 struct RgbaF {
@@ -476,15 +477,16 @@ impl X11OverlayWindow {
         anchor_x: i32,
         anchor_y: i32,
         deadzone: u32,
-        theme: String,
+        theme: &str,
         opacity: f32,
         allow_horizontal: bool,
-    ) {
+    ) -> bool {
         let half = (INDICATOR_SIZE as i32) / 2;
         let x = anchor_x - half;
         let y = anchor_y - half;
 
-        self.theme = theme;
+        self.theme.clear();
+        self.theme.push_str(theme);
         self.deadzone = deadzone;
         self.opacity = opacity;
         self.allow_horizontal = allow_horizontal;
@@ -502,23 +504,31 @@ impl X11OverlayWindow {
             self.opacity,
         );
 
-        let _ = self.conn.configure_window(
-            self.win,
-            &ConfigureWindowAux::new()
-                .x(x)
-                .y(y)
-                .stack_mode(StackMode::ABOVE),
-        );
+        if self
+            .conn
+            .configure_window(
+                self.win,
+                &ConfigureWindowAux::new()
+                    .x(x)
+                    .y(y)
+                    .stack_mode(StackMode::ABOVE),
+            )
+            .is_err()
+        {
+            return false;
+        }
         if !self.is_mapped {
-            let _ = self.conn.map_window(self.win);
+            if self.conn.map_window(self.win).is_err() {
+                return false;
+            }
             self.is_mapped = true;
         }
-        self.upload_pixels();
+        self.upload_pixels()
     }
 
-    fn update_offset(&mut self, delta_x: f32, delta_y: f32) {
+    fn update_offset(&mut self, delta_x: f32, delta_y: f32) -> bool {
         if !self.is_mapped {
-            return;
+            return true;
         }
         let next_mask =
             ArrowMask::from_offset(delta_x, delta_y, self.deadzone, self.allow_horizontal);
@@ -531,45 +541,62 @@ impl X11OverlayWindow {
                 self.allow_horizontal,
                 self.opacity,
             );
-            self.upload_pixels();
+            return self.upload_pixels();
         }
+        true
     }
 
-    fn hide(&mut self) {
+    fn hide(&mut self) -> bool {
         if self.is_mapped {
-            let _ = self.conn.unmap_window(self.win);
-            let _ = self.conn.flush();
+            if self.conn.unmap_window(self.win).is_err() || self.conn.flush().is_err() {
+                self.is_mapped = false;
+                return false;
+            }
             self.is_mapped = false;
         }
+        true
     }
 
-    fn upload_pixels(&self) {
+    fn upload_pixels(&self) -> bool {
         let size_u16 = INDICATOR_SIZE as u16;
-        let _ = self.conn.put_image(
-            ImageFormat::Z_PIXMAP,
-            self.win,
-            self.gc,
-            size_u16,
-            size_u16,
-            0,
-            0,
-            0,
-            32,
-            &self.pixels,
-        );
-        let _ = self.conn.flush();
+        if self
+            .conn
+            .put_image(
+                ImageFormat::Z_PIXMAP,
+                self.win,
+                self.gc,
+                size_u16,
+                size_u16,
+                0,
+                0,
+                0,
+                32,
+                &self.pixels,
+            )
+            .is_err()
+        {
+            return false;
+        }
+        self.conn.flush().is_ok()
     }
 
-    fn drain_expose_events(&self) {
+    fn drain_expose_events(&self) -> bool {
         let mut saw_expose = false;
-        while let Ok(Some(ev)) = self.conn.poll_for_event() {
-            if matches!(ev, x11rb::protocol::Event::Expose(_)) {
-                saw_expose = true;
+        loop {
+            match self.conn.poll_for_event() {
+                Ok(Some(ev)) => {
+                    if matches!(ev, x11rb::protocol::Event::Expose(_)) {
+                        saw_expose = true;
+                    }
+                }
+                Ok(None) => break,
+                Err(_) => return false,
             }
         }
         if saw_expose && self.is_mapped {
-            self.upload_pixels();
+            return self.upload_pixels();
         }
+        true
     }
 }
 
@@ -616,13 +643,13 @@ fn set_atom_list_prop(conn: &RustConnection, win: u32, prop_name: &[u8], atom_na
 
 /// Manages the background indicator rendering & X11 window thread.
 pub struct IndicatorHandle {
-    tx: Sender<IndicatorCommand>,
+    tx: SyncSender<IndicatorCommand>,
     handle: Option<JoinHandle<()>>,
 }
 
 impl IndicatorHandle {
-    pub fn spawn() -> (Self, Sender<IndicatorCommand>) {
-        let (tx, rx) = mpsc::channel();
+    pub fn spawn() -> (Self, SyncSender<IndicatorCommand>) {
+        let (tx, rx) = mpsc::sync_channel(INDICATOR_CHANNEL_CAPACITY);
         let tx_clone = tx.clone();
         let handle = thread::Builder::new()
             .name("breeze-indicator".to_string())
@@ -632,7 +659,9 @@ impl IndicatorHandle {
     }
 
     pub fn stop(&mut self) {
-        let _ = self.tx.send(IndicatorCommand::Shutdown);
+        if self.tx.try_send(IndicatorCommand::Shutdown).is_err() {
+            let _ = self.tx.send(IndicatorCommand::Shutdown);
+        }
         if let Some(h) = self.handle.take() {
             let _ = h.join();
         }
@@ -645,11 +674,48 @@ impl Drop for IndicatorHandle {
     }
 }
 
+/// Pulls the next indicator command, coalescing consecutive queued `UpdateOffset` bursts
+/// down to the most recent offset while strictly preserving `Show` / `Hide` / `Shutdown` order.
+fn next_coalesced_command(
+    rx: &Receiver<IndicatorCommand>,
+    pending: &mut Option<IndicatorCommand>,
+) -> Option<IndicatorCommand> {
+    let first = match pending.take() {
+        Some(cmd) => cmd,
+        None => rx.recv().ok()?,
+    };
+
+    match first {
+        IndicatorCommand::UpdateOffset {
+            mut delta_x,
+            mut delta_y,
+        } => {
+            while let Ok(next) = rx.try_recv() {
+                match next {
+                    IndicatorCommand::UpdateOffset {
+                        delta_x: nx,
+                        delta_y: ny,
+                    } => {
+                        delta_x = nx;
+                        delta_y = ny;
+                    }
+                    other => {
+                        *pending = Some(other);
+                        break;
+                    }
+                }
+            }
+            Some(IndicatorCommand::UpdateOffset { delta_x, delta_y })
+        }
+        other => Some(other),
+    }
+}
+
 fn run_indicator_loop(rx: Receiver<IndicatorCommand>) {
     let mut overlay = X11OverlayWindow::new();
+    let mut pending: Option<IndicatorCommand> = None;
 
-    while let Ok(cmd) = rx.recv() {
-        // Coalesce burst offset updates while preserving Show / Hide / Shutdown order
+    while let Some(cmd) = next_coalesced_command(&rx, &mut pending) {
         match cmd {
             IndicatorCommand::Show {
                 anchor_x,
@@ -662,26 +728,46 @@ fn run_indicator_loop(rx: Receiver<IndicatorCommand>) {
                 if overlay.is_none() {
                     overlay = X11OverlayWindow::new();
                 }
-                if let Some(ov) = overlay.as_mut() {
+                let shown_ok = overlay.as_mut().is_some_and(|ov| {
                     ov.show(
                         anchor_x,
                         anchor_y,
                         deadzone,
-                        theme,
+                        &theme,
                         opacity,
                         allow_horizontal,
-                    );
+                    )
+                });
+                if !shown_ok {
+                    // X11 / XWayland connection dropped (e.g. XWayland restart): reconnect once immediately
+                    overlay = X11OverlayWindow::new();
+                    if let Some(ov) = overlay.as_mut()
+                        && !ov.show(
+                            anchor_x,
+                            anchor_y,
+                            deadzone,
+                            &theme,
+                            opacity,
+                            allow_horizontal,
+                        )
+                    {
+                        overlay = None;
+                    }
                 }
             }
             IndicatorCommand::UpdateOffset { delta_x, delta_y } => {
                 if let Some(ov) = overlay.as_mut() {
-                    ov.update_offset(delta_x, delta_y);
-                    ov.drain_expose_events();
+                    let ok = ov.update_offset(delta_x, delta_y) && ov.drain_expose_events();
+                    if !ok {
+                        overlay = None;
+                    }
                 }
             }
             IndicatorCommand::Hide => {
-                if let Some(ov) = overlay.as_mut() {
-                    ov.hide();
+                if let Some(ov) = overlay.as_mut()
+                    && !ov.hide()
+                {
+                    overlay = None;
                 }
             }
             IndicatorCommand::Shutdown => break,
@@ -734,5 +820,61 @@ mod tests {
         assert!(mask.right);
         assert!(!mask.down);
         assert!(!mask.left);
+    }
+
+    #[test]
+    fn coalesces_burst_update_offsets_while_preserving_show_hide_shutdown_order() {
+        let (tx, rx) = mpsc::sync_channel(16);
+        let mut pending = None;
+
+        tx.try_send(IndicatorCommand::UpdateOffset {
+            delta_x: 1.0,
+            delta_y: 2.0,
+        })
+        .unwrap();
+        tx.try_send(IndicatorCommand::UpdateOffset {
+            delta_x: 10.0,
+            delta_y: 20.0,
+        })
+        .unwrap();
+        tx.try_send(IndicatorCommand::UpdateOffset {
+            delta_x: 42.0,
+            delta_y: -35.0,
+        })
+        .unwrap();
+        tx.try_send(IndicatorCommand::Hide).unwrap();
+        tx.try_send(IndicatorCommand::UpdateOffset {
+            delta_x: 5.0,
+            delta_y: 5.0,
+        })
+        .unwrap();
+        tx.try_send(IndicatorCommand::Shutdown).unwrap();
+
+        // First call coalesces all three initial UpdateOffsets into the latest (42, -35)
+        assert_eq!(
+            next_coalesced_command(&rx, &mut pending),
+            Some(IndicatorCommand::UpdateOffset {
+                delta_x: 42.0,
+                delta_y: -35.0,
+            })
+        );
+        // Hide is preserved in exact order immediately after
+        assert_eq!(
+            next_coalesced_command(&rx, &mut pending),
+            Some(IndicatorCommand::Hide)
+        );
+        // Subsequent UpdateOffset before Shutdown
+        assert_eq!(
+            next_coalesced_command(&rx, &mut pending),
+            Some(IndicatorCommand::UpdateOffset {
+                delta_x: 5.0,
+                delta_y: 5.0,
+            })
+        );
+        // Shutdown is preserved in exact order
+        assert_eq!(
+            next_coalesced_command(&rx, &mut pending),
+            Some(IndicatorCommand::Shutdown)
+        );
     }
 }
